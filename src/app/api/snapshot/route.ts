@@ -12,7 +12,7 @@ const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || '';
 // === BANANA constants (edit these only) ===
 const TRACKED_MINT       = 'BCtJf5K5NVqCgksEb9rervX6Eae17NDZ8BSdGSoEpump'; // $BANANA mint
 const REWARD_WALLET      = '2dPD6abjP5YrjFo3T53Uf82EuV6XFJLAZaq5KDEnvqC7'; // reward pool wallet
-const PUMPFUN_AMM_WALLET = '8LQ1RAzjSZKcwoPNANcDMvs71TZ3cp3zAEErnyAsdTcr'; // exclude AMM
+const PUMPFUN_AMM_WALLET = 'AFavQw5TtcuRM8R1LbVh8DG9w3EdU7ExEQMvEn4yrSZM'; // exclude AMM
 const TOKENS_PER_APE     = 100_000;
 // ===========================================
 
@@ -323,5 +323,6 @@ export async function GET(req: Request) {
     });
   }
 }
+
 
 
