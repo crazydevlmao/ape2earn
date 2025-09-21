@@ -287,7 +287,7 @@ export default function ApeBananaApp() {
         if (res.ok) {
           const j = await res.json();
           const hs: Holder[] = Array.isArray(j?.holders)
-            ? j.holders.map((x: any) => ({ wallet: String(x.address ?? x.wallet ?? ''), balance: toNum(x.balance, 0) }))
+            ? j.holders.map((x: { address?: string; wallet?: string; balance?: number | string }) => ({ wallet: String(x.address ?? x.wallet ?? ''), balance: toNum(x.balance, 0) }))
             : [];
           setHolders(hs);
           setPool(toNum(j?.rewardPoolBanana, 0));
