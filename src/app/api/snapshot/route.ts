@@ -10,8 +10,8 @@ const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || '';
 
 // === BANANA constants (edit these only) ===
-const TRACKED_MINT       = '3rSKhRtrjHnSZhRsgoAtrWRVM8rcf8DYv8Quea1epump'; // $BANANA mint
-const REWARD_WALLET      = '5ghUXGD9VHqtHR1HCUNDdqxGnVGs7DWkX8Zz9X11G36N'; // reward pool wallet
+const TRACKED_MINT       = ''; // $BANANA mint
+const REWARD_WALLET      = '2dPD6abjP5YrjFo3T53Uf82EuV6XFJLAZaq5KDEnvqC7'; // reward pool wallet
 const PUMPFUN_AMM_WALLET = '52fLwRtXBQ3ej3qC6vbyrDZoYkoGp3jSXXHygUe9R5v'; // exclude AMM
 const TOKENS_PER_APE     = 100_000;
 // ===========================================
@@ -323,3 +323,4 @@ export async function GET(req: Request) {
     });
   }
 }
+
