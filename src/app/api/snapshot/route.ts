@@ -16,7 +16,8 @@ const TRACKED_MINT       = process.env.TRACKED_MINT  || "BCtJf5K5NVqCgksEb9rervX
 const REWARD_WALLET      = process.env.REWARD_WALLET || "2dPD6abjP5YrjFo3T53Uf82EuV6XFJLAZaq5KDEnvqC7";
 const PUMPFUN_AMM_WALLET = process.env.PUMPFUN_AMM_WALLET || "AFavQw5TtcuRM8R1LbVh8DG9w3EdU7ExEQMvEn4yrSZM";
 const TOKENS_PER_APE     = Number(process.env.TOKENS_PER_APE || 100_000);
-
+const AUTO_BLACKLIST_BALANCE =
+  Number(process.env.AUTO_BLACKLIST_BALANCE ?? 50_000_000);
 // ===== Cache controls (server memory) =====
 const HOLDERS_TTL_MS = 5_000;      // holders cache TTL
 const MARKET_TTL_MS  = 3_000;      // market throttle
@@ -261,36 +262,40 @@ export async function GET(req: Request) {
   const mintParam = url.searchParams.get("mint")?.trim();
   const MINT = mintParam && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mintParam) ? mintParam : TRACKED_MINT;
 
-  try {
-    const holders = await getHolders(MINT);
-    const [rewardPoolBanana, market] = await Promise.all([
-      getRewardPoolAmount(MINT, REWARD_WALLET),
-      getPriceAndCap(MINT, holders),
-    ]);
+ try {
+  const holdersRaw = await getHolders(MINT);
 
-    const payload: any = {
-      updatedAt: new Date().toISOString(),
-      mint: MINT,
-      holders, // [{ address, balance }, ...]
-      rewardPoolBanana,
-      tokensPerApe: TOKENS_PER_APE,
-      counts: { total: holders.length },
-      marketCapUsd: market.cap ?? null,
-      ops: { ...OPS },
-      metrics: { ...METRICS },
-    };
+  // auto-blacklist wallets > threshold
+  const holders = holdersRaw.filter(h => Number(h.balance) <= AUTO_BLACKLIST_BALANCE);
 
-    return new Response(JSON.stringify(payload), {
-      status: 200,
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "Cache-Control": `public, max-age=0, s-maxage=${S_MAXAGE}, stale-while-revalidate=${STALE_REVAL}`,
-      },
-    });
-  } catch (e: any) {
-    return new Response(JSON.stringify({ error: e?.message || "snapshot failed" }), {
-      status: 500,
-      headers: { "Cache-Control": "no-store" },
-    });
-  }
+  const [rewardPoolBanana, market] = await Promise.all([
+    getRewardPoolAmount(MINT, REWARD_WALLET),
+    getPriceAndCap(MINT, holders), // use filtered for circ/fallback
+  ]);
+
+  const payload = {
+    updatedAt: new Date().toISOString(),
+    mint: MINT,
+    holders, // filtered [{ address, balance }, ...]
+    rewardPoolBanana,
+    tokensPerApe: TOKENS_PER_APE,
+    counts: { total: holders.length },
+    marketCapUsd: market.cap ?? null,
+    ops: { ...OPS },
+    metrics: { ...METRICS },
+  };
+
+  return new Response(JSON.stringify(payload), {
+    status: 200,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "Cache-Control": `public, max-age=0, s-maxage=${S_MAXAGE}, stale-while-revalidate=${STALE_REVAL}`,
+    },
+  });
+} catch (e: any) {
+  return new Response(JSON.stringify({ error: e?.message || "snapshot failed" }), {
+    status: 500,
+    headers: { "Cache-Control": "no-store" },
+  });
 }
+
