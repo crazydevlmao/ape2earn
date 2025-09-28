@@ -13,12 +13,13 @@ import {
   createAssociatedTokenAccountIdempotentInstruction,
   createTransferCheckedInstruction,
 } from "@solana/spl-token";
+import bs58 from "bs58";
 
 // ================= CONFIG =================
 const CYCLE_MINUTES = 5;
 
 const TRACKED_MINT = process.env.TRACKED_MINT || "";
-const REWARD_WALLET = process.env.REWARD_WALLET || ""; // should be the same as the DEV wallet pubkey used to sign sends
+const REWARD_WALLET = process.env.REWARD_WALLET || ""; // should match dev wallet pubkey
 const DEV_WALLET_PRIVATE_KEY = process.env.DEV_WALLET_PRIVATE_KEY || "";
 const TOKENS_PER_APE = Number(process.env.TOKENS_PER_APE || 100_000);
 const AUTO_BLACKLIST_BALANCE = Number(process.env.AUTO_BLACKLIST_BALANCE ?? 50_000_000);
@@ -31,8 +32,8 @@ const QUICKNODE_RPC = process.env.QUICKNODE_RPC || ""; // optional failover
 const PUMPORTAL_URL = process.env.PUMPORTAL_URL || "";
 const PUMPORTAL_KEY = process.env.PUMPORTAL_KEY || "";
 
-const ADMIN_SECRET  = process.env.ADMIN_SECRET || "";   // optional — for pushing ops to UI
-const ADMIN_OPS_URL = process.env.ADMIN_OPS_URL || ""; // optional — POST target for ops
+const ADMIN_SECRET  = process.env.ADMIN_SECRET || "";
+const ADMIN_OPS_URL = process.env.ADMIN_OPS_URL || "";
 
 if (!TRACKED_MINT || !REWARD_WALLET || !DEV_WALLET_PRIVATE_KEY) {
   throw new Error("Missing TRACKED_MINT, REWARD_WALLET, or DEV_WALLET_PRIVATE_KEY");
@@ -42,14 +43,8 @@ if (!HELIUS_RPC) throw new Error("Missing HELIUS_RPC / HELIUS_API_KEY");
 // ================= Connection / Keys =================
 const RPCS = [HELIUS_RPC, QUICKNODE_RPC].filter(Boolean);
 let rpcIdx = 0;
-function newConnection(): Connection {
-  return new Connection(RPCS[rpcIdx]!, "confirmed");
-}
-function rotateConnection(): Connection {
-  rpcIdx = (rpcIdx + 1) % RPCS.length;
-  return new Connection(RPCS[rpcIdx]!, "confirmed");
-}
-
+function newConnection(): Connection { return new Connection(RPCS[rpcIdx]!, "confirmed"); }
+function rotateConnection(): Connection { rpcIdx = (rpcIdx + 1) % RPCS.length; return new Connection(RPCS[rpcIdx]!, "confirmed"); }
 let connection = newConnection();
 
 // accept JSON array secret or bs58
@@ -58,7 +53,6 @@ function toKeypair(secret: string): Keypair {
     const arr = JSON.parse(secret);
     return Keypair.fromSecretKey(Uint8Array.from(arr));
   } catch {
-    const bs58 = require("bs58");
     return Keypair.fromSecretKey(bs58.decode(secret));
   }
 }
@@ -80,19 +74,10 @@ function floorCycleStart(d = new Date()) {
 function nextTimes() {
   const start = floorCycleStart();
   const end   = new Date(start.getTime() + CYCLE_MINUTES * 60_000);
-  return {
-    id: String(start.getTime()),
-    start, end,
-    tMinus60: new Date(end.getTime() - 60_000),
-    tMinus10: new Date(end.getTime() - 10_000),
-  };
+  return { id: String(start.getTime()), start, end, tMinus60: new Date(end.getTime() - 60_000), tMinus10: new Date(end.getTime() - 10_000) };
 }
 const apes = (bal: number) => Math.floor((Number(bal) || 0) / TOKENS_PER_APE);
-function chunks<T>(arr: T[], size: number): T[][] {
-  const out: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
-}
+function chunks<T>(arr: T[], size: number): T[][] { const out: T[][] = []; for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size)); return out; }
 function looksRetryableMessage(msg: string) {
   return /rate.?limit|429|timeout|temporar|connection|ECONNRESET|ETIMEDOUT|blockhash|Node is behind|Transaction was not confirmed/i.test(msg);
 }
@@ -167,14 +152,14 @@ async function getHoldersAll(mint: string) {
       c.getProgramAccounts(new PublicKey(programId), {
         filters, encoding: "jsonParsed", commitment: "confirmed",
       })
-    );
+    ) as any; // cast for TS
+
     const out: Record<string, number> = {};
-    for (const it of accs) {
+    for (const it of accs as any[]) {
       const info: any = (it.account.data as any)?.parsed?.info;
       const owner = info?.owner;
       const ta = info?.tokenAmount;
-      const amt =
-        typeof ta?.uiAmount === "number" ? ta.uiAmount : Number(ta?.uiAmountString ?? 0);
+      const amt = typeof ta?.uiAmount === "number" ? ta.uiAmount : Number(ta?.uiAmountString ?? 0);
       if (!owner || !(amt > 0)) continue;
       out[owner] = (out[owner] ?? 0) + amt;
     }
@@ -199,22 +184,20 @@ async function getHoldersAll(mint: string) {
 async function tokenBalance(owner: PublicKey) {
   const resp = await withConnRetries(c =>
     c.getParsedTokenAccountsByOwner(owner, { mint: mintPubkey }, "confirmed")
-  );
+  ) as any; // cast for TS
+
   let total = 0;
-  for (const it of resp.value) {
+  for (const it of resp.value as any[]) {
     const parsed: any = (it.account.data as any)?.parsed?.info?.tokenAmount;
-    const v =
-      typeof parsed?.uiAmount === "number"
-        ? parsed.uiAmount
-        : Number(parsed?.uiAmountString ?? 0);
+    const v = typeof parsed?.uiAmount === "number" ? parsed.uiAmount : Number(parsed?.uiAmountString ?? 0);
     total += v || 0;
   }
   return total;
 }
 
 async function getMintDecimals(mintPk: PublicKey): Promise<number> {
-  const info = await withConnRetries(c => c.getParsedAccountInfo(mintPk, "confirmed"));
-  const dec = (info.value as any)?.data?.parsed?.info?.decimals;
+  const info = await withConnRetries(c => c.getParsedAccountInfo(mintPk, "confirmed")) as any;
+  const dec = info?.value?.data?.parsed?.info?.decimals;
   if (typeof dec !== "number") throw new Error("Unable to fetch mint decimals");
   return dec;
 }
@@ -227,7 +210,7 @@ async function triggerClaimAndSwap90() {
     return { claimed: 0, swapped: 0, claimTx: null, swapTx: null };
   }
 
-  // Claim creator rewards (with retries)
+  // Claim (with retries)
   const { res: claimRes, json: claimJson } = await withRetries(
     () => callPumportal(
       "/api/trade",
@@ -284,12 +267,13 @@ async function triggerClaimAndSwap90() {
 // ================= Snapshot + Airdrop (T-10s) =================
 const sentCycles = new Set<string>(); // idempotency
 
-async function sendAirdropBatch(ixs: import("@solana/web3.js").TransactionInstruction[]) {
+async function sendAirdropBatch(ixs: any[]) {
   return await withRetries(async () => {
     const tx = new Transaction();
     for (const ix of ixs) tx.add(ix);
     tx.feePayer = devWallet.publicKey;
-    tx.recentBlockhash = (await withConnRetries(c => c.getLatestBlockhash("finalized"))).blockhash;
+    const lbh = await withConnRetries(c => c.getLatestBlockhash("finalized"));
+    tx.recentBlockhash = lbh.blockhash;
     return await sendAndConfirmTransaction(connection, tx, [devWallet], {
       skipPreflight: true,
       commitment: "confirmed",
@@ -299,13 +283,9 @@ async function sendAirdropBatch(ixs: import("@solana/web3.js").TransactionInstru
 
 async function snapshotAndDistribute() {
   const cycleId = String(floorCycleStart().getTime());
-  if (sentCycles.has(cycleId)) {
-    // minimal log; avoid spam
-    console.log(`[AIRDROP] already sent for cycle ${cycleId}`);
-    return;
-  }
+  if (sentCycles.has(cycleId)) { console.log(`[AIRDROP] already sent for cycle ${cycleId}`); return; }
 
-  // Eligible holders
+  // Eligible holders (+ blacklist cap)
   const holdersRaw = await getHoldersAll(TRACKED_MINT);
   const holders = holdersRaw.filter(h => Number(h.balance) <= AUTO_BLACKLIST_BALANCE);
 
@@ -316,7 +296,7 @@ async function snapshotAndDistribute() {
   if (totalApes <= 0) { console.log(`[AIRDROP] no eligible apes`); return; }
 
   // 90% of available token balance in the DEV wallet
-  const poolUi  = await tokenBalance(devWallet.publicKey);
+  const poolUi   = await tokenBalance(devWallet.publicKey);
   const toSendUi = Math.floor(poolUi * 0.90);
   if (!(toSendUi > 0)) { console.log(`[AIRDROP] pool empty after 90% rule`); return; }
 
@@ -336,7 +316,6 @@ async function snapshotAndDistribute() {
       const recipient = new PublicKey(r.wallet);
       const toAta = getAssociatedTokenAddressSync(mintPubkey, recipient, false);
 
-      // always include idempotent ATA creation (no pre-checks) + checked transfer
       ixs.push(
         createAssociatedTokenAccountIdempotentInstruction(
           devWallet.publicKey, toAta, recipient, mintPubkey
@@ -353,19 +332,17 @@ async function snapshotAndDistribute() {
 
     const sig = await sendAirdropBatch(ixs);
     batches++;
-    console.log(`[AIRDROP] batch ${batches} (${group.length} wallets) | per-APE=${perApeUi} | https://solscan.io/tx/${sig}`);
+    console.log(`[AIRDROP] batch ${batches} (${group.length}) | per-APE=${perApeUi} | https://solscan.io/tx/${sig}`);
   }
 
   sentCycles.add(cycleId);
 
-  // Push summary for UI (includes count & per-ape + no spam list of txs)
   await recordOps({
     lastAirdrop: {
       at: new Date().toISOString(),
       cycleId,
       perApeUi,
       count: rows.length,
-      // txs are printed in logs above; keep UI payload small
     }
   });
 
