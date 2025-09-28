@@ -29,8 +29,19 @@ const HELIUS_RPC =
   `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY || ""}`;
 const QUICKNODE_RPC = process.env.QUICKNODE_RPC || ""; // optional failover
 
-const PUMPORTAL_URL = process.env.PUMPORTAL_URL || "";
-const PUMPORTAL_KEY = process.env.PUMPORTAL_KEY || "";
+// === PumpPortal config (bulletproof) ===
+const PUMP_HOST = "api.pumpportal.xyz";
+const RAW_PUMPORTAL_URL = (process.env.PUMPORTAL_URL || "").trim().replace(/\/+$/, "");
+let PUMPORTAL_BASE: string;
+try {
+  const u = RAW_PUMPORTAL_URL ? new URL(RAW_PUMPORTAL_URL) : new URL(`https://${PUMP_HOST}`);
+  u.hostname = PUMP_HOST; // force correct host even if env is wrong
+  PUMPORTAL_BASE = u.origin;
+} catch {
+  PUMPORTAL_BASE = `https://${PUMP_HOST}`;
+}
+const PUMPORTAL_KEY = (process.env.PUMPORTAL_KEY || "").trim();
+console.log("[CONFIG] PumpPortal base:", PUMPORTAL_BASE);
 
 const ADMIN_SECRET  = process.env.ADMIN_SECRET || "";
 const ADMIN_OPS_URL = process.env.ADMIN_OPS_URL || "";
@@ -125,8 +136,9 @@ async function recordOps(partial: { lastClaim?: any; lastSwap?: any; lastAirdrop
 
 // ================= PumpPortal helpers =================
 async function callPumportal(path: string, body: any, idemKey: string) {
-  if (!PUMPORTAL_URL || !PUMPORTAL_KEY) throw new Error("Missing PumpPortal creds");
-  const res = await fetch(`${PUMPORTAL_URL}${path}`, {
+  if (!PUMPORTAL_BASE || !PUMPORTAL_KEY) throw new Error("Missing PumpPortal config");
+  const url = new URL(path, PUMPORTAL_BASE).toString();
+  const res = await fetch(url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -192,7 +204,7 @@ async function getMintDecimals(mintPk: PublicKey): Promise<number> {
 // ================= Claim + Swap (T-60s) =================
 async function triggerClaimAndSwap90() {
   const cycleId = String(floorCycleStart().getTime());
-  if (!PUMPORTAL_URL || !PUMPORTAL_KEY) {
+  if (!PUMPORTAL_BASE || !PUMPORTAL_KEY) {
     console.warn("[CLAIM] Skipping claim/swap; no PumpPortal creds.");
     return { claimed: 0, swapped: 0, claimTx: null, swapTx: null };
   }
