@@ -30,18 +30,18 @@ const HELIUS_RPC =
 const QUICKNODE_RPC = process.env.QUICKNODE_RPC || ""; // optional failover
 
 // === PumpPortal config (bulletproof) ===
-// Official base is pumpportal.fun (no api. subdomain)
 const PUMP_HOST = "pumpportal.fun";
 const RAW_PUMPORTAL_URL = (process.env.PUMPORTAL_URL || "").trim().replace(/\/+$/, "");
 let PUMPORTAL_BASE: string;
 try {
   const u = RAW_PUMPORTAL_URL ? new URL(RAW_PUMPORTAL_URL) : new URL(`https://${PUMP_HOST}`);
   u.hostname = PUMP_HOST; // force correct host even if env is wrong
-  PUMPORTAL_BASE = u.origin; // e.g. https://pumpportal.fun
+  PUMPORTAL_BASE = u.origin;
 } catch {
   PUMPORTAL_BASE = `https://${PUMP_HOST}`;
 }
 const PUMPORTAL_KEY = (process.env.PUMPORTAL_KEY || "").trim();
+const PUMPORTAL_WALLET = (process.env.PUMPORTAL_WALLET || "").trim(); // optional: Lightning wallet pubkey (for logging)
 console.log("[CONFIG] PumpPortal base:", PUMPORTAL_BASE);
 
 const ADMIN_SECRET  = process.env.ADMIN_SECRET || "";
@@ -137,12 +137,8 @@ async function recordOps(partial: { lastClaim?: any; lastSwap?: any; lastAirdrop
 
 // ================= PumpPortal helpers =================
 function portalUrl(path: string) {
-  // PumpPortal Lightning API expects ?api-key=... in query (docs default)
   const u = new URL(path, PUMPORTAL_BASE);
-  if (PUMPORTAL_KEY) {
-    // Append api-key if not present
-    if (!u.searchParams.has("api-key")) u.searchParams.set("api-key", PUMPORTAL_KEY);
-  }
+  if (PUMPORTAL_KEY && !u.searchParams.has("api-key")) u.searchParams.set("api-key", PUMPORTAL_KEY);
   return u.toString();
 }
 
@@ -153,8 +149,7 @@ async function callPumportal(path: string, body: any, idemKey: string) {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      // Most examples use ?api-key=; keep header too in case they accept Bearer.
-      authorization: `Bearer ${PUMPORTAL_KEY}`,
+      authorization: `Bearer ${PUMPORTAL_KEY}`, // keep header too
       "Idempotency-Key": idemKey,
     },
     body: JSON.stringify(body),
@@ -213,6 +208,15 @@ async function getMintDecimals(mintPk: PublicKey): Promise<number> {
   return dec;
 }
 
+// helper (optional): log lightning wallet SOL
+async function logPortalWalletSol() {
+  if (!PUMPORTAL_WALLET) return;
+  try {
+    const bal = await withConnRetries(c => c.getBalance(new PublicKey(PUMPORTAL_WALLET), "confirmed"));
+    console.log(`[PORTAL WALLET] ${PUMPORTAL_WALLET} SOL=${(bal/1e9).toFixed(6)}`);
+  } catch {}
+}
+
 // ================= Claim + Swap (T-60s) =================
 async function triggerClaimAndSwap90() {
   const cycleId = String(floorCycleStart().getTime());
@@ -225,7 +229,8 @@ async function triggerClaimAndSwap90() {
   const { res: claimRes, json: claimJson } = await withRetries(
     () => callPumportal(
       "/api/trade",
-      { action: "collectCreatorFee", mint: TRACKED_MINT, pool: "pump", priorityFee: 0.000001 },
+      // NOTE: Docs say mint not strictly required for pump curve, but harmless to include.
+      { action: "collectCreatorFee", mint: TRACKED_MINT, pool: "pump", priorityFee: 0.00005 },
       `claim:${cycleId}`
     ),
     5
@@ -237,28 +242,37 @@ async function triggerClaimAndSwap90() {
   const claimUrl = claimTx ? `https://solscan.io/tx/${claimTx}` : null;
   console.log(`[CLAIM] ${claimed} SOL | ${claimUrl ?? ""}`);
 
+  // tiny settle gap helps portal wallet update before buy
+  await sleep(1500);
+  await logPortalWalletSol();
+
   let swapped = 0;
   let swapTx: string | null = null;
   let swapUrl: string | null = null;
 
   if (claimed > 0) {
+    const spend = Math.max(0, Number((claimed * 0.9).toFixed(6)));
     const { res: swapRes, json: swapJson } = await withRetries(
       () => callPumportal(
         "/api/trade",
         {
           action: "buy",
           mint: TRACKED_MINT,
-          amount: (claimed * 0.9).toFixed(6),
+          amount: spend,
           denominatedInSol: true,
-          slippage: 5,
-          priorityFee: 0.000001,
+          slippage: 10,          // a bit wider to avoid sim fails
+          priorityFee: 0.00005,  // realistic tip as per docs
           pool: "pump",
         },
         `swap:${cycleId}`
       ),
       5
     );
-    if (!swapRes.ok) throw new Error(`Swap failed: ${JSON.stringify(swapJson)}`);
+
+    if (!swapRes.ok) {
+      console.error("[SWAP ERROR]", swapJson); // show exact reason (eg Insufficient SOL)
+      throw new Error(`Swap failed: ${JSON.stringify(swapJson)}`);
+    }
 
     swapped = Number(swapJson?.outAmount ?? 0);
     swapTx = swapJson?.txid || null;
