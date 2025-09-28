@@ -289,7 +289,7 @@ export default function ApeBananaApp() {
   const popupTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // single loader
-  const loadRef = useRef<() => Promise<void>>();
+const loadRef = useRef<() => Promise<void>>(async () => {});
   loadRef.current = async () => {
     try {
       // add ts param to smash caches at the edge
@@ -611,3 +611,4 @@ export default function ApeBananaApp() {
     </div>
   );
 }
+
