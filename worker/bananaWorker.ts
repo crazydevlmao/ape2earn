@@ -6,6 +6,7 @@ import {
   PublicKey,
   Keypair,
   Transaction,
+  VersionedTransaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import {
@@ -29,20 +30,24 @@ const HELIUS_RPC =
   `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY || ""}`;
 const QUICKNODE_RPC = process.env.QUICKNODE_RPC || ""; // optional failover
 
-// === PumpPortal config (bulletproof) ===
-const PUMP_HOST = "pumpportal.fun";
+// == PumpPortal (CLAIM ONLY) ==
+const PUMP_HOST = "pumpportal.fun"; // normalized
 const RAW_PUMPORTAL_URL = (process.env.PUMPORTAL_URL || "").trim().replace(/\/+$/, "");
 let PUMPORTAL_BASE: string;
 try {
   const u = RAW_PUMPORTAL_URL ? new URL(RAW_PUMPORTAL_URL) : new URL(`https://${PUMP_HOST}`);
-  u.hostname = PUMP_HOST; // force correct host even if env is wrong
-  PUMPORTAL_BASE = u.origin;
+  u.hostname = PUMP_HOST;
+  PUMPORTAL_BASE = u.origin; // e.g. https://pumpportal.fun
 } catch {
   PUMPORTAL_BASE = `https://${PUMP_HOST}`;
 }
 const PUMPORTAL_KEY = (process.env.PUMPORTAL_KEY || "").trim();
-const PUMPORTAL_WALLET = (process.env.PUMPORTAL_WALLET || "").trim(); // optional: Lightning wallet pubkey (for logging)
 console.log("[CONFIG] PumpPortal base:", PUMPORTAL_BASE);
+
+// == Jupiter (for swaps) ==
+const JUP_QUOTE_URL = "https://quote-api.jup.ag/v6/quote";
+const JUP_SWAP_URL  = "https://quote-api.jup.ag/v6/swap";
+const SOL_MINT = "So11111111111111111111111111111111111111112"; // wSOL
 
 const ADMIN_SECRET  = process.env.ADMIN_SECRET || "";
 const ADMIN_OPS_URL = process.env.ADMIN_OPS_URL || "";
@@ -123,6 +128,11 @@ async function withConnRetries<T>(fn: (c: Connection) => Promise<T>, attempts = 
   throw lastErr;
 }
 
+// Signature extractor for misc JSON
+function extractSig(j: any): string | null {
+  return j?.signature || j?.tx || j?.txid || j?.txId || j?.result || j?.sig || null;
+}
+
 // ================= Admin ops → front page =================
 async function recordOps(partial: { lastClaim?: any; lastSwap?: any; lastAirdrop?: any }) {
   if (!ADMIN_SECRET || !ADMIN_OPS_URL) return;
@@ -135,7 +145,7 @@ async function recordOps(partial: { lastClaim?: any; lastSwap?: any; lastAirdrop
   } catch { /* swallow */ }
 }
 
-// ================= PumpPortal helpers =================
+// ================= PumpPortal (CLAIM only) =================
 function portalUrl(path: string) {
   const u = new URL(path, PUMPORTAL_BASE);
   if (PUMPORTAL_KEY && !u.searchParams.has("api-key")) u.searchParams.set("api-key", PUMPORTAL_KEY);
@@ -149,7 +159,7 @@ async function callPumportal(path: string, body: any, idemKey: string) {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${PUMPORTAL_KEY}`, // keep header too
+      authorization: `Bearer ${PUMPORTAL_KEY}`, // tolerated
       "Idempotency-Key": idemKey,
     },
     body: JSON.stringify(body),
@@ -158,6 +168,51 @@ async function callPumportal(path: string, body: any, idemKey: string) {
   let json: any = {};
   try { json = text ? JSON.parse(text) : {}; } catch {}
   return { res, json };
+}
+
+// ================= Jupiter helpers (SWAP) =================
+async function jupQuoteSOLtoMint(outputMint: string, solAmount: number, slippageBps = 1000) {
+  const lamports = Math.max(1, Math.floor(solAmount * 1_000_000_000));
+  const url = new URL(JUP_QUOTE_URL);
+  url.searchParams.set("inputMint", SOL_MINT);
+  url.searchParams.set("outputMint", outputMint);
+  url.searchParams.set("amount", String(lamports));
+  url.searchParams.set("slippageBps", String(slippageBps));
+  url.searchParams.set("swapMode", "ExactIn");
+  url.searchParams.set("onlyDirectRoutes", "false");
+  url.searchParams.set("asLegacyTransaction", "false");
+
+  const res = await fetch(url.toString(), { method: "GET" });
+  if (!res.ok) throw new Error(`Jupiter quote error: HTTP ${res.status}`);
+  return await res.json();
+}
+
+async function jupBuildSwapTx(quoteResponse: any, userPubkey: string) {
+  const res = await fetch(JUP_SWAP_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      quoteResponse,
+      userPublicKey: userPubkey,
+      wrapAndUnwrapSol: true,
+      dynamicSlippage: { maxBps: 1200 }, // allow a bit more than initial quote
+      // compute unit price may help speed:
+      // prioritizationFeeLamports: 100000, // optional
+    }),
+  });
+  const json = await res.json();
+  if (!res.ok) throw new Error(`Jupiter swap build error: ${JSON.stringify(json)}`);
+  return json; // contains swapTransaction (base64)
+}
+
+async function jupExecuteSwap(swapTxBase64: string): Promise<string> {
+  const raw = Buffer.from(swapTxBase64, "base64");
+  const vtx = VersionedTransaction.deserialize(raw);
+  vtx.sign([devWallet]); // sign with our key
+  // send + confirm
+  const sig = await withConnRetries(c => c.sendRawTransaction(vtx.serialize(), { skipPreflight: false }));
+  await withConnRetries(c => c.confirmTransaction(sig, "confirmed"));
+  return sig;
 }
 
 // ================= Chain helpers =================
@@ -208,85 +263,53 @@ async function getMintDecimals(mintPk: PublicKey): Promise<number> {
   return dec;
 }
 
-// helper (optional): log lightning wallet SOL
-async function logPortalWalletSol() {
-  if (!PUMPORTAL_WALLET) return;
-  try {
-    const bal = await withConnRetries(c => c.getBalance(new PublicKey(PUMPORTAL_WALLET), "confirmed"));
-    console.log(`[PORTAL WALLET] ${PUMPORTAL_WALLET} SOL=${(bal/1e9).toFixed(6)}`);
-  } catch {}
-}
-
-// ================= Claim + Swap (T-60s) =================
+// ================= Claim + Jupiter Swap (T-60s) =================
 async function triggerClaimAndSwap90() {
   const cycleId = String(floorCycleStart().getTime());
   if (!PUMPORTAL_BASE || !PUMPORTAL_KEY) {
     console.warn("[CLAIM] Skipping claim/swap; no PumpPortal creds.");
-    return { claimed: 0, swapped: 0, claimTx: null, swapTx: null };
+    return { claimed: 0, swapSig: null, claimSig: null };
   }
 
-  // Claim (with retries)
+  // 1) Claim creator rewards (PumpPortal)
   const { res: claimRes, json: claimJson } = await withRetries(
     () => callPumportal(
       "/api/trade",
-      // NOTE: Docs say mint not strictly required for pump curve, but harmless to include.
-      { action: "collectCreatorFee", mint: TRACKED_MINT, pool: "pump", priorityFee: 0.00005 },
+      { action: "collectCreatorFee", priorityFee: 0.000001, pool: "pump", mint: TRACKED_MINT },
       `claim:${cycleId}`
     ),
     5
   );
   if (!claimRes.ok) throw new Error(`Claim failed: ${JSON.stringify(claimJson)}`);
 
+  const claimSig = extractSig(claimJson);
   const claimed = Number(claimJson?.claimedAmount ?? 0);
-  const claimTx = claimJson?.txid || null;
-  const claimUrl = claimTx ? `https://solscan.io/tx/${claimTx}` : null;
-  console.log(`[CLAIM] ${claimed} SOL | ${claimUrl ?? ""}`);
+  const claimUrl = claimSig ? `https://solscan.io/tx/${claimSig}` : null;
+  console.log(`[CLAIM] ${claimed} SOL | ${claimUrl ?? "(no sig)"}`);
 
-  // tiny settle gap helps portal wallet update before buy
-  await sleep(1500);
-  await logPortalWalletSol();
-
-  let swapped = 0;
-  let swapTx: string | null = null;
-  let swapUrl: string | null = null;
-
+  // 2) Swap 90% of claimed SOL to token via Jupiter
+  let swapSig: string | null = null;
   if (claimed > 0) {
-    const spend = Math.max(0, Number((claimed * 0.9).toFixed(6)));
-    const { res: swapRes, json: swapJson } = await withRetries(
-      () => callPumportal(
-        "/api/trade",
-        {
-          action: "buy",
-          mint: TRACKED_MINT,
-          amount: spend,
-          denominatedInSol: true,
-          slippage: 10,          // a bit wider to avoid sim fails
-          priorityFee: 0.00005,  // realistic tip as per docs
-          pool: "pump",
-        },
-        `swap:${cycleId}`
-      ),
-      5
-    );
-
-    if (!swapRes.ok) {
-      console.error("[SWAP ERROR]", swapJson); // show exact reason (eg Insufficient SOL)
-      throw new Error(`Swap failed: ${JSON.stringify(swapJson)}`);
+    const spendSol = Math.max(Number((claimed * 0.9).toFixed(6)), 0.0001);
+    try {
+      const quote = await withRetries(() => jupQuoteSOLtoMint(TRACKED_MINT, spendSol, 1000 /*10%*/ ), 4);
+      const built = await withRetries(() => jupBuildSwapTx(quote, devWallet.publicKey.toBase58()), 4);
+      const swapTxB64 = built?.swapTransaction;
+      if (!swapTxB64) throw new Error(`No swapTransaction in Jupiter response: ${JSON.stringify(built)}`);
+      swapSig = await withRetries(() => jupExecuteSwap(swapTxB64), 4);
+      console.log(`[SWAP] spent ~${spendSol} SOL → https://solscan.io/tx/${swapSig}`);
+    } catch (e: any) {
+      console.error("[SWAP ERROR]", e?.message || e);
     }
-
-    swapped = Number(swapJson?.outAmount ?? 0);
-    swapTx = swapJson?.txid || null;
-    swapUrl = swapTx ? `https://solscan.io/tx/${swapTx}` : null;
-    console.log(`[SWAP] ~${swapped} tokens | ${swapUrl ?? ""}`);
   }
 
   const now = new Date().toISOString();
   await recordOps({
-    lastClaim: { at: now, amount: claimed, tx: claimTx, url: claimUrl },
-    lastSwap:  { at: now, amount: swapped, tx: swapTx,  url: swapUrl  },
+    lastClaim: { at: now, amount: claimed, tx: claimSig, url: claimSig ? `https://solscan.io/tx/${claimSig}` : null },
+    lastSwap:  { at: now, amount: null,   tx: swapSig,  url: swapSig ? `https://solscan.io/tx/${swapSig}` : null },
   });
 
-  return { claimed, swapped, claimTx, swapTx };
+  return { claimed, swapSig, claimSig };
 }
 
 // ================= Snapshot + Airdrop (T-10s) =================
@@ -312,7 +335,7 @@ async function snapshotAndDistribute() {
 
   const holdersRaw = await getHoldersAll(TRACKED_MINT);
 
-  // Exclude > cap (default 50,000,000 UI units)
+  // Exclude > cap (default 50,000,000 UI units) — avoids LP/AMM vault whales
   const excluded = holdersRaw.filter(h => h.balance > AUTO_BLACKLIST_BALANCE);
   if (excluded.length > 0) {
     console.log(`[SNAPSHOT] Excluded ${excluded.length} wallets over cap ${AUTO_BLACKLIST_BALANCE}`);
