@@ -141,25 +141,30 @@ async function callPumportal(path: string, body: any, idemKey: string) {
   return { res, json };
 }
 
-// ================= Chain helpers =================
+// ================= Chain helpers (patched) =================
 async function getHoldersAll(mint: string) {
   const mintPk = new PublicKey(mint);
 
   async function scan(programId: string, addFilter165 = false) {
     const filters: any[] = [{ memcmp: { offset: 0, bytes: mintPk.toBase58() } }];
-    if (addFilter165) filters.unshift({ dataSize: 165 });
+    if (addFilter165) filters.unshift({ dataSize: 165 }); // classic SPL Token accounts
+
+    // Use getParsedProgramAccounts (no encoding param, returns parsed data)
     const accs = await withConnRetries(c =>
-      c.getProgramAccounts(new PublicKey(programId), {
-        filters, encoding: "jsonParsed", commitment: "confirmed",
+      c.getParsedProgramAccounts(new PublicKey(programId), {
+        filters,
+        commitment: "confirmed",
       })
-    ) as any; // cast for TS
+    ) as any[];
 
     const out: Record<string, number> = {};
-    for (const it of accs as any[]) {
-      const info: any = (it.account.data as any)?.parsed?.info;
+    for (const it of accs) {
+      // parsed form: it.account.data.parsed.info.tokenAmount.uiAmount
+      const info: any = it?.account?.data?.parsed?.info;
       const owner = info?.owner;
       const ta = info?.tokenAmount;
-      const amt = typeof ta?.uiAmount === "number" ? ta.uiAmount : Number(ta?.uiAmountString ?? 0);
+      const amt =
+        typeof ta?.uiAmount === "number" ? ta.uiAmount : Number(ta?.uiAmountString ?? 0);
       if (!owner || !(amt > 0)) continue;
       out[owner] = (out[owner] ?? 0) + amt;
     }
@@ -178,8 +183,9 @@ async function getHoldersAll(mint: string) {
 
   return Object.entries(merged)
     .map(([wallet, balance]) => ({ wallet, balance: Number(balance) }))
-    .filter((r) => r.balance > 0);
+    .filter(r => r.balance > 0);
 }
+
 
 async function tokenBalance(owner: PublicKey) {
   const resp = await withConnRetries(c =>
@@ -374,3 +380,4 @@ loop().catch((err) => {
   console.error("bananaWorker crashed:", err);
   process.exit(1);
 });
+
