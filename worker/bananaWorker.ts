@@ -178,7 +178,6 @@ function deepFindNumber(obj: any, keys: string[]): number {
       if (num > 0) return num;
     }
   }
-  // recursive scan for first positive numeric-ish value
   for (const v of Object.values(obj)) {
     if (v && typeof v === "object") {
       const hit = deepFindNumber(v, keys);
@@ -188,22 +187,17 @@ function deepFindNumber(obj: any, keys: string[]): number {
   return 0;
 }
 function parseClaimedSol(json: any): number {
-  // try common fields first
   let sol = 0;
   sol = Math.max(sol, parseNumber(json?.claimedAmount));
   sol = Math.max(sol, parseNumber(json?.amount));
   sol = Math.max(sol, parseNumber(json?.sol));
   sol = Math.max(sol, parseNumber(json?.uiAmount));
-  // lamports?
   const lamports =
     parseNumber(json?.lamports) ||
     parseNumber(json?.claimedLamports) ||
     deepFindNumber(json, ["lamports", "claimedLamports"]);
   if (lamports > 0) sol = Math.max(sol, lamports / 1_000_000_000);
-  // deep scan for weird keys that still look like SOL amounts
-  if (sol <= 0) {
-    sol = deepFindNumber(json, ["claimedAmount", "amount", "sol", "uiAmount"]);
-  }
+  if (sol <= 0) sol = deepFindNumber(json, ["claimedAmount", "amount", "sol", "uiAmount"]);
   return sol > 0 ? sol : 0;
 }
 async function getWalletSol(pubkey: PublicKey): Promise<number> {
@@ -223,7 +217,6 @@ async function jupQuoteSOLtoToken(outMint: string, solAmount: number, slippageBp
   url.searchParams.set("amount", String(lamports));
   url.searchParams.set("slippageBps", String(slippageBps));
   url.searchParams.set("onlyDirectRoutes", "false");
-  url.searchParams.set("excludeDexes", "Serum"); // optional hygiene
   const res = await fetch(url.toString());
   if (!res.ok) throw new Error(`Jupiter quote failed: HTTP ${res.status}`);
   return res.json();
@@ -262,7 +255,6 @@ async function jupSendSwap(base64Tx: string) {
 }
 
 async function jupSwapSpendSOL(outMint: string, solToSpend: number) {
-  // adaptive retries across slippage levels
   const slippagePlan = [100, 200, 500]; // 1%, 2%, 5%
   let lastErr: any;
   for (const bps of slippagePlan) {
@@ -329,6 +321,9 @@ async function getMintDecimals(mintPk: PublicKey): Promise<number> {
 async function triggerClaimAndSwap90() {
   const cycleId = String(floorCycleStart().getTime());
 
+  // measure SOL before claim
+  const solBefore = await getWalletSol(devWallet.publicKey);
+
   // ---- CLAIM via PumpPortal
   if (!PUMPORTAL_BASE || !PUMPORTAL_KEY) {
     console.warn("[CLAIM] Skipping claim; no PumpPortal creds.");
@@ -346,19 +341,35 @@ async function triggerClaimAndSwap90() {
   if (!claimRes.ok) throw new Error(`Claim failed: ${JSON.stringify(claimJson)}`);
 
   const claimSig = extractSig(claimJson);
-  const claimedParsed = parseClaimedSol(claimJson);
-  const claimUrl = claimSig ? `https://solscan.io/tx/${claimSig}` : null;
-  console.log(`[CLAIM] ~${claimedParsed} SOL | ${claimUrl ?? "(no sig)"}`);
+  if (claimSig) {
+    try { await withConnRetries(c => c.confirmTransaction(claimSig, "confirmed")); } catch {}
+  }
 
-  // ---- Determine SOL to spend (90% of claimed, else 90% of wallet SOL)
-  const solNow = await getWalletSol(devWallet.publicKey);
+  // re-measure SOL after claim (retry a few times until it settles)
+  let solAfter = solBefore;
+  for (let i = 0; i < 6; i++) {
+    await sleep(400 + i * 100);
+    try {
+      solAfter = await getWalletSol(devWallet.publicKey);
+      if (solAfter >= solBefore) break;
+    } catch {}
+  }
+
+  const parsedFromJson = parseClaimedSol(claimJson);
+  // allow a small fee buffer (claim tx fee), 0.0002 SOL
+  const byBalanceDelta = Math.max(0, solAfter - solBefore - 0.0002);
+
+  const claimedDetected = Math.max(parsedFromJson, byBalanceDelta);
+  const claimUrl = claimSig ? `https://solscan.io/tx/${claimSig}` : null;
+  console.log(`[CLAIM] parsed=${parsedFromJson} | delta=${byBalanceDelta} | using=${claimedDetected} SOL | ${claimUrl ?? "(no sig)"}`);
+
+  // ---- Compute SOL to spend: strictly 90% of claimedDetected, capped by availableAfter
   const reserve = 0.02; // keep some SOL for fees
+  const availableAfter = Math.max(0, solAfter - reserve);
+  const spendCandidate = Number((claimedDetected * 0.9).toFixed(6));
   let spend = 0;
-  if (claimedParsed > 0) {
-    spend = Math.max(Number((claimedParsed * 0.9).toFixed(6)), 0.0001);
-  } else {
-    const available = Math.max(solNow - reserve, 0);
-    spend = Number((available * 0.90).toFixed(6));
+  if (spendCandidate > 0 && availableAfter > 0) {
+    spend = Math.min(spendCandidate, availableAfter);
   }
 
   let swapSig: string | null = null;
@@ -375,16 +386,16 @@ async function triggerClaimAndSwap90() {
       console.error("[SWAP] Jupiter failed after retries:", e?.message || e);
     }
   } else {
-    console.log("[SWAP] Skipped (spend too small).");
+    console.log(`[SWAP] Skipped (spend=${spend}, candidate=${spendCandidate}, available=${availableAfter}).`);
   }
 
   const now = new Date().toISOString();
   await recordOps({
-    lastClaim: { at: now, amount: claimedParsed, tx: claimSig, url: claimUrl },
-    lastSwap:  { at: now, amount: 0, tx: swapSig,  url: swapSig ? `https://solscan.io/tx/${swapSig}` : null },
+    lastClaim: { at: now, amount: claimedDetected, tx: claimSig, url: claimUrl },
+    lastSwap:  { at: now, amount: spend, tx: swapSig,  url: swapSig ? `https://solscan.io/tx/${swapSig}` : null },
   });
 
-  return { claimed: claimedParsed, swapped: 0, claimTx: claimSig, swapTx: swapSig };
+  return { claimed: claimedDetected, swapped: spend, claimTx: claimSig, swapTx: swapSig };
 }
 
 // ================= Snapshot + Airdrop (T-10s) =================
