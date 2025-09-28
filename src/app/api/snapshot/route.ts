@@ -317,13 +317,12 @@ export async function GET(req: Request) {
         "Cache-Control": `public, max-age=0, s-maxage=${S_MAXAGE}, stale-while-revalidate=${STALE_REVAL}`,
       },
     });
-  } catch (e: any) {
-    return new Response(
-      JSON.stringify({ error: e?.message || "snapshot failed" }),
-      {
-        status: 500,
-        headers: { "Cache-Control": "no-store" },
-      }
-    );
+   } catch (e: any) {
+    return new Response(JSON.stringify({ error: e?.message || "snapshot failed" }), {
+      status: 500,
+      headers: { "Cache-Control": "no-store" },
+    });
   }
 }
+
+
