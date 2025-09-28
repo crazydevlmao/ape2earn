@@ -232,7 +232,7 @@ async function jupSwap(conn: Connection, signer: Keypair, quoteResp: any) {
   const swapReq = {
     quoteResponse: quoteResp,
     userPublicKey: signer.publicKey.toBase58(),
-    wrapAndUnwrapSol: true,                 // Jupiter wraps exactly the amount in quote
+    wrapAndUnwrapSol: true,
     dynamicComputeUnitLimit: true,
     prioritizationFeeLamports: "auto",
   };
@@ -341,6 +341,12 @@ async function triggerClaimAndSwap90() {
 /* ================= Snapshot + Airdrop (T-10s) ================= */
 const sentCycles = new Set<string>();
 
+// NEW: detect “transaction too large”
+function isTxTooLarge(err: any): boolean {
+  const msg = String(err?.message || err || "").toLowerCase();
+  return msg.includes("transaction too large") || msg.includes("tx too large") || /size.*>/.test(msg);
+}
+
 async function sendAirdropBatch(ixs: any[]) {
   return await withRetries(async () => {
     const tx = new Transaction();
@@ -349,10 +355,68 @@ async function sendAirdropBatch(ixs: any[]) {
     const lbh = await withConnRetries(c => c.getLatestBlockhash("finalized"));
     tx.recentBlockhash = lbh.blockhash;
     return await sendAndConfirmTransaction(connection, tx, [devWallet], {
-      skipPreflight: true,
+      skipPreflight: false,   // enable preflight so size errors surface earlier
       commitment: "confirmed",
+      maxRetries: 3,
     });
-  }, 5);
+  }, 3);
+}
+
+// NEW: adaptive airdrop sender that halves group size on “tx too large”
+async function sendAirdropsAdaptive(rows: Array<{ wallet: string; apes: number }>, perApeUi: number, decimals: number) {
+  const factor = 10 ** decimals;
+  const uiToBase = (x: number) => BigInt(Math.floor(x * factor));
+  const fromAta = getAssociatedTokenAddressSync(mintPubkey, devWallet.publicKey, false);
+
+  let idx = 0;
+  let groupSize = Math.min(10, Math.max(1, Math.floor(1232 / 110))); // start conservative (≈10 wallets)
+  let batchNum = 0;
+
+  while (idx < rows.length) {
+    const end = Math.min(rows.length, idx + groupSize);
+    const group = rows.slice(idx, end);
+
+    // build ixs for this group
+    const ixs: any[] = [];
+    for (const r of group) {
+      const recipient = new PublicKey(r.wallet);
+      const toAta = getAssociatedTokenAddressSync(mintPubkey, recipient, false);
+
+      ixs.push(
+        createAssociatedTokenAccountIdempotentInstruction(
+          devWallet.publicKey, toAta, recipient, mintPubkey
+        )
+      );
+
+      const amountBase = uiToBase(perApeUi * r.apes);
+      if (amountBase > 0n) {
+        ixs.push(
+          createTransferCheckedInstruction(
+            fromAta, mintPubkey, toAta, devWallet.publicKey, amountBase, decimals
+          )
+        );
+      }
+    }
+
+    try {
+      const sig = await sendAirdropBatch(ixs);
+      batchNum++;
+      console.log(`[AIRDROP] batch ${batchNum} (${group.length}) | per-APE=${perApeUi} | https://solscan.io/tx/${sig}`);
+      idx = end; // advance
+      // try to gently grow if we’ve been shrinking
+      if (groupSize < 10) groupSize = Math.min(10, groupSize + 1);
+    } catch (e: any) {
+      if (isTxTooLarge(e) && groupSize > 1) {
+        // halve and retry same window
+        groupSize = Math.max(1, Math.floor(groupSize / 2));
+        console.warn(`[AIRDROP] tx too large; reducing group size to ${groupSize} and retrying…`);
+        await sleep(150);
+        continue;
+      }
+      // non-size error → surface
+      throw e;
+    }
+  }
 }
 
 async function snapshotAndDistribute() {
@@ -383,36 +447,9 @@ async function snapshotAndDistribute() {
   if (!(perApeUi > 0)) { console.log(`[AIRDROP] per-APE too small`); return; }
 
   const decimals = await getMintDecimals(mintPubkey);
-  const factor = 10 ** decimals;
-  const uiToBase = (x: number) => BigInt(Math.floor(x * factor));
 
-  const fromAta = getAssociatedTokenAddressSync(mintPubkey, devWallet.publicKey, false);
-
-  let batches = 0;
-  for (const group of chunks(rows, 12)) {
-    const ixs: any[] = [];
-    for (const r of group) {
-      const recipient = new PublicKey(r.wallet);
-      const toAta = getAssociatedTokenAddressSync(mintPubkey, recipient, false);
-
-      ixs.push(
-        createAssociatedTokenAccountIdempotentInstruction(
-          devWallet.publicKey, toAta, recipient, mintPubkey
-        )
-      );
-
-      const amountBase = uiToBase(perApeUi * r.apes);
-      ixs.push(
-        createTransferCheckedInstruction(
-          fromAta, mintPubkey, toAta, devWallet.publicKey, amountBase, decimals
-        )
-      );
-    }
-
-    const sig = await sendAirdropBatch(ixs);
-    batches++;
-    console.log(`[AIRDROP] batch ${batches} (${group.length}) | per-APE=${perApeUi} | https://solscan.io/tx/${sig}`);
-  }
+  // ADAPTIVE SEND (prevents “Transaction too large”)
+  await sendAirdropsAdaptive(rows, perApeUi, decimals);
 
   sentCycles.add(cycleId);
 
