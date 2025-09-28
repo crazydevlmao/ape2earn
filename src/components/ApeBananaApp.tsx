@@ -471,7 +471,7 @@ export default function ApeBananaApp() {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="relative rounded-2xl border-2 border-yellow-300 bg-white px-4 py-3 shadow-[0_6px_0_#facc15]">
               <div className="flex items-center justify-between">
-                <div className="text-[10px] uppercase tracking-widest text-neutral-500/80">Latest Creator Rewards Claim</div>
+                <div className="text-[10px] uppercase tracking-widest text-neutral-500/80">Latest Rewards Claim</div>
               </div>
               <div className="mt-1 text-2xl font-black text-yellow-600 tabular-nums" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>
                 {ops?.lastClaim ? Math.floor(ops.lastClaim.amount).toLocaleString() : '--'}
@@ -581,3 +581,4 @@ export default function ApeBananaApp() {
     </div>
   );
 }
+
