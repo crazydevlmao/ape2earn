@@ -1,4 +1,4 @@
-// tsconfig.worker.json
+
 {
   "compilerOptions": {
     "target": "ES2022",
@@ -14,3 +14,4 @@
   },
   "include": ["worker/**/*.ts"]
 }
+
