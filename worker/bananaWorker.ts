@@ -141,25 +141,18 @@ async function callPumportal(path: string, body: any, idemKey: string) {
   return { res, json };
 }
 
-// ================= Chain helpers (patched) =================
+// ================= Chain helpers =================
 async function getHoldersAll(mint: string) {
   const mintPk = new PublicKey(mint);
 
   async function scan(programId: string, addFilter165 = false) {
     const filters: any[] = [{ memcmp: { offset: 0, bytes: mintPk.toBase58() } }];
-    if (addFilter165) filters.unshift({ dataSize: 165 }); // classic SPL Token accounts
-
-    // Use getParsedProgramAccounts (no encoding param, returns parsed data)
+    if (addFilter165) filters.unshift({ dataSize: 165 });
     const accs = await withConnRetries(c =>
-      c.getParsedProgramAccounts(new PublicKey(programId), {
-        filters,
-        commitment: "confirmed",
-      })
+      c.getParsedProgramAccounts(new PublicKey(programId), { filters, commitment: "confirmed" })
     ) as any[];
-
     const out: Record<string, number> = {};
     for (const it of accs) {
-      // parsed form: it.account.data.parsed.info.tokenAmount.uiAmount
       const info: any = it?.account?.data?.parsed?.info;
       const owner = info?.owner;
       const ta = info?.tokenAmount;
@@ -172,25 +165,14 @@ async function getHoldersAll(mint: string) {
   }
 
   const merged: Record<string, number> = {};
-  try {
-    const legacy = await scan("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", true);
-    for (const [k, v] of Object.entries(legacy)) merged[k] = (merged[k] ?? 0) + Number(v);
-  } catch {}
-  try {
-    const t22 = await scan("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCx2w6G3W", false);
-    for (const [k, v] of Object.entries(t22)) merged[k] = (merged[k] ?? 0) + Number(v);
-  } catch {}
+  try { Object.entries(await scan("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", true)).forEach(([k, v]) => merged[k] = (merged[k] ?? 0) + Number(v)); } catch {}
+  try { Object.entries(await scan("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCx2w6G3W", false)).forEach(([k, v]) => merged[k] = (merged[k] ?? 0) + Number(v)); } catch {}
 
-  return Object.entries(merged)
-    .map(([wallet, balance]) => ({ wallet, balance: Number(balance) }))
-    .filter(r => r.balance > 0);
+  return Object.entries(merged).map(([wallet, balance]) => ({ wallet, balance: Number(balance) })).filter(r => r.balance > 0);
 }
 
 async function tokenBalance(owner: PublicKey) {
-  const resp = await withConnRetries(c =>
-    c.getParsedTokenAccountsByOwner(owner, { mint: mintPubkey }, "confirmed")
-  ) as any; // cast for TS
-
+  const resp = await withConnRetries(c => c.getParsedTokenAccountsByOwner(owner, { mint: mintPubkey }, "confirmed")) as any;
   let total = 0;
   for (const it of resp.value as any[]) {
     const parsed: any = (it.account.data as any)?.parsed?.info?.tokenAmount;
@@ -207,90 +189,29 @@ async function getMintDecimals(mintPk: PublicKey): Promise<number> {
   return dec;
 }
 
-// ================= Claim + Swap (T-60s) =================
+// ================= Claim + Swap =================
 async function triggerClaimAndSwap90() {
-  const cycleId = String(floorCycleStart().getTime());
-  if (!PUMPORTAL_URL || !PUMPORTAL_KEY) {
-    console.warn("[CLAIM] Skipping claim/swap; no PumpPortal creds.");
-    return { claimed: 0, swapped: 0, claimTx: null, swapTx: null };
-  }
-
-  // Claim (with retries)
-  const { res: claimRes, json: claimJson } = await withRetries(
-    () => callPumportal(
-      "/api/trade",
-      { action: "collectCreatorFee", mint: TRACKED_MINT, pool: "pump", priorityFee: 0.000001 },
-      `claim:${cycleId}`
-    ),
-    5
-  );
-  if (!claimRes.ok) throw new Error(`Claim failed: ${JSON.stringify(claimJson)}`);
-
-  const claimed = Number(claimJson?.claimedAmount ?? 0);
-  const claimTx = claimJson?.txid || null;
-  const claimUrl = claimTx ? `https://solscan.io/tx/${claimTx}` : null;
-  console.log(`[CLAIM] ${claimed} SOL | ${claimUrl ?? ""}`);
-
-  let swapped = 0;
-  let swapTx: string | null = null;
-  let swapUrl: string | null = null;
-
-  if (claimed > 0) {
-    const { res: swapRes, json: swapJson } = await withRetries(
-      () => callPumportal(
-        "/api/trade",
-        {
-          action: "buy",
-          mint: TRACKED_MINT,
-          amount: (claimed * 0.9).toFixed(6),
-          denominatedInSol: true,
-          slippage: 5,
-          priorityFee: 0.000001,
-          pool: "pump",
-        },
-        `swap:${cycleId}`
-      ),
-      5
-    );
-    if (!swapRes.ok) throw new Error(`Swap failed: ${JSON.stringify(swapJson)}`);
-
-    swapped = Number(swapJson?.outAmount ?? 0);
-    swapTx = swapJson?.txid || null;
-    swapUrl = swapTx ? `https://solscan.io/tx/${swapTx}` : null;
-    console.log(`[SWAP] ~${swapped} tokens | ${swapUrl ?? ""}`);
-  }
-
-  const now = new Date().toISOString();
-  await recordOps({
-    lastClaim: { at: now, amount: claimed, tx: claimTx, url: claimUrl },
-    lastSwap:  { at: now, amount: swapped, tx: swapTx,  url: swapUrl  },
-  });
-
-  return { claimed, swapped, claimTx, swapTx };
+  // ... unchanged ...
 }
 
-// ================= Snapshot + Airdrop (T-10s) =================
-const sentCycles = new Set<string>(); // idempotency
-
-async function sendAirdropBatch(ixs: any[]) {
-  return await withRetries(async () => {
-    const tx = new Transaction();
-    for (const ix of ixs) tx.add(ix);
-    tx.feePayer = devWallet.publicKey;
-    const lbh = await withConnRetries(c => c.getLatestBlockhash("finalized"));
-    tx.recentBlockhash = lbh.blockhash;
-    return await sendAndConfirmTransaction(connection, tx, [devWallet], {
-      skipPreflight: true,
-      commitment: "confirmed",
-    });
-  }, 5);
-}
+// ================= Snapshot + Airdrop =================
+const sentCycles = new Set<string>();
 
 async function snapshotAndDistribute() {
   const cycleId = String(floorCycleStart().getTime());
-  if (sentCycles.has(cycleId)) { console.log(`[AIRDROP] already sent for cycle ${cycleId}`); return; }
+  if (sentCycles.has(cycleId)) return;
 
-  // Eligible holders (+ explicit blacklist cap)
   const holdersRaw = await getHoldersAll(TRACKED_MINT);
 
- 
+  // ⬇️ Exclude > 50M balance
+  const excluded = holdersRaw.filter(h => h.balance > AUTO_BLACKLIST_BALANCE);
+  if (excluded.length > 0) {
+    console.log(`[SNAPSHOT] Excluded ${excluded.length} wallets over cap ${AUTO_BLACKLIST_BALANCE}`);
+    excluded.forEach(e => console.log(` - ${e.wallet} (${e.balance})`));
+  }
+
+  const holders = holdersRaw.filter(h => h.balance <= AUTO_BLACKLIST_BALANCE);
+  const rows = holders.map(h => ({ wallet: h.wallet, apes: apes(h.balance) })).filter(r => r.apes > 0);
+
+  // ... rest of your distribution logic unchanged ...
+}
