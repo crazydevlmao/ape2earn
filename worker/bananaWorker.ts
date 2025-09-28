@@ -8,6 +8,7 @@ import {
   Transaction,
   VersionedTransaction,
   sendAndConfirmTransaction,
+  LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
 import {
   getAssociatedTokenAddressSync,
@@ -30,24 +31,19 @@ const HELIUS_RPC =
   `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY || ""}`;
 const QUICKNODE_RPC = process.env.QUICKNODE_RPC || ""; // optional failover
 
-// == PumpPortal (CLAIM ONLY) ==
-const PUMP_HOST = "pumpportal.fun"; // normalized
+// === PumpPortal (claim only) ===
+const PUMP_HOST = "pumpportal.fun";
 const RAW_PUMPORTAL_URL = (process.env.PUMPORTAL_URL || "").trim().replace(/\/+$/, "");
 let PUMPORTAL_BASE: string;
 try {
   const u = RAW_PUMPORTAL_URL ? new URL(RAW_PUMPORTAL_URL) : new URL(`https://${PUMP_HOST}`);
-  u.hostname = PUMP_HOST;
-  PUMPORTAL_BASE = u.origin; // e.g. https://pumpportal.fun
+  u.hostname = PUMP_HOST; // normalize host
+  PUMPORTAL_BASE = u.origin; // https://pumpportal.fun
 } catch {
   PUMPORTAL_BASE = `https://${PUMP_HOST}`;
 }
 const PUMPORTAL_KEY = (process.env.PUMPORTAL_KEY || "").trim();
 console.log("[CONFIG] PumpPortal base:", PUMPORTAL_BASE);
-
-// == Jupiter (for swaps) ==
-const JUP_QUOTE_URL = "https://quote-api.jup.ag/v6/quote";
-const JUP_SWAP_URL  = "https://quote-api.jup.ag/v6/swap";
-const SOL_MINT = "So11111111111111111111111111111111111111112"; // wSOL
 
 const ADMIN_SECRET  = process.env.ADMIN_SECRET || "";
 const ADMIN_OPS_URL = process.env.ADMIN_OPS_URL || "";
@@ -75,6 +71,7 @@ function toKeypair(secret: string): Keypair {
 }
 const devWallet = toKeypair(DEV_WALLET_PRIVATE_KEY);
 const mintPubkey = new PublicKey(TRACKED_MINT);
+const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 if (REWARD_WALLET !== devWallet.publicKey.toBase58()) {
   console.warn(
@@ -128,7 +125,7 @@ async function withConnRetries<T>(fn: (c: Connection) => Promise<T>, attempts = 
   throw lastErr;
 }
 
-// Signature extractor for misc JSON
+// Signature extractor (PumpPortal)
 function extractSig(j: any): string | null {
   return j?.signature || j?.tx || j?.txid || j?.txId || j?.result || j?.sig || null;
 }
@@ -145,7 +142,7 @@ async function recordOps(partial: { lastClaim?: any; lastSwap?: any; lastAirdrop
   } catch { /* swallow */ }
 }
 
-// ================= PumpPortal (CLAIM only) =================
+// ================= PumpPortal (claim) =================
 function portalUrl(path: string) {
   const u = new URL(path, PUMPORTAL_BASE);
   if (PUMPORTAL_KEY && !u.searchParams.has("api-key")) u.searchParams.set("api-key", PUMPORTAL_KEY);
@@ -159,7 +156,7 @@ async function callPumportal(path: string, body: any, idemKey: string) {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${PUMPORTAL_KEY}`, // tolerated
+      authorization: `Bearer ${PUMPORTAL_KEY}`,     // tolerated; main auth is ?api-key
       "Idempotency-Key": idemKey,
     },
     body: JSON.stringify(body),
@@ -168,51 +165,6 @@ async function callPumportal(path: string, body: any, idemKey: string) {
   let json: any = {};
   try { json = text ? JSON.parse(text) : {}; } catch {}
   return { res, json };
-}
-
-// ================= Jupiter helpers (SWAP) =================
-async function jupQuoteSOLtoMint(outputMint: string, solAmount: number, slippageBps = 1000) {
-  const lamports = Math.max(1, Math.floor(solAmount * 1_000_000_000));
-  const url = new URL(JUP_QUOTE_URL);
-  url.searchParams.set("inputMint", SOL_MINT);
-  url.searchParams.set("outputMint", outputMint);
-  url.searchParams.set("amount", String(lamports));
-  url.searchParams.set("slippageBps", String(slippageBps));
-  url.searchParams.set("swapMode", "ExactIn");
-  url.searchParams.set("onlyDirectRoutes", "false");
-  url.searchParams.set("asLegacyTransaction", "false");
-
-  const res = await fetch(url.toString(), { method: "GET" });
-  if (!res.ok) throw new Error(`Jupiter quote error: HTTP ${res.status}`);
-  return await res.json();
-}
-
-async function jupBuildSwapTx(quoteResponse: any, userPubkey: string) {
-  const res = await fetch(JUP_SWAP_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      quoteResponse,
-      userPublicKey: userPubkey,
-      wrapAndUnwrapSol: true,
-      dynamicSlippage: { maxBps: 1200 }, // allow a bit more than initial quote
-      // compute unit price may help speed:
-      // prioritizationFeeLamports: 100000, // optional
-    }),
-  });
-  const json = await res.json();
-  if (!res.ok) throw new Error(`Jupiter swap build error: ${JSON.stringify(json)}`);
-  return json; // contains swapTransaction (base64)
-}
-
-async function jupExecuteSwap(swapTxBase64: string): Promise<string> {
-  const raw = Buffer.from(swapTxBase64, "base64");
-  const vtx = VersionedTransaction.deserialize(raw);
-  vtx.sign([devWallet]); // sign with our key
-  // send + confirm
-  const sig = await withConnRetries(c => c.sendRawTransaction(vtx.serialize(), { skipPreflight: false }));
-  await withConnRetries(c => c.confirmTransaction(sig, "confirmed"));
-  return sig;
 }
 
 // ================= Chain helpers =================
@@ -263,15 +215,102 @@ async function getMintDecimals(mintPk: PublicKey): Promise<number> {
   return dec;
 }
 
-// ================= Claim + Jupiter Swap (T-60s) =================
+// ================= Jupiter swap helpers (with adaptive retries) =================
+async function jupQuoteSOLtoMint(
+  outMint: string,
+  lamportsIn: number,
+  slippageBps = 1000,
+) {
+  const u = new URL("https://quote-api.jup.ag/v6/quote");
+  u.searchParams.set("inputMint", SOL_MINT);
+  u.searchParams.set("outputMint", outMint);
+  u.searchParams.set("amount", String(lamportsIn));     // SOL in lamports
+  u.searchParams.set("swapMode", "ExactIn");
+  u.searchParams.set("slippageBps", String(slippageBps));
+  u.searchParams.set("onlyDirectRoutes", "false");
+  u.searchParams.set("asLegacyTransaction", "false");
+  const res = await fetch(u.toString());
+  const j = await res.json();
+  if (!res.ok || j.error) throw new Error("Jupiter quote failed: " + (j.error || res.statusText));
+  return j;
+}
+
+async function jupBuildSwap(quoteResponse: any, userPubkey: string) {
+  const res = await fetch("https://api.jup.ag/swap/v1/swap", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      quoteResponse,
+      userPublicKey: userPubkey,
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      dynamicSlippage: true,
+      prioritizationFeeLamports: {
+        priorityLevelWithMaxLamports: { priorityLevel: "veryHigh", maxLamports: 1_500_000 },
+      },
+    }),
+  });
+  const j = await res.json();
+  if (!res.ok || j.error) throw new Error("Jupiter swap build failed: " + (j.error || res.statusText));
+  return j;
+}
+
+async function jupSendSignedSwap(swapTxB64: string) {
+  const vtx = VersionedTransaction.deserialize(Buffer.from(swapTxB64, "base64"));
+  vtx.sign([devWallet]);
+  const sig = await withConnRetries(c => c.sendRawTransaction(vtx.serialize(), { skipPreflight: false, maxRetries: 3 }));
+  try {
+    const latest = await withConnRetries(c => c.getLatestBlockhash("finalized"));
+    await withConnRetries(c => c.confirmTransaction({ signature: sig, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight }, "confirmed"));
+  } catch {}
+  return sig;
+}
+
+// ONE place that performs swap with multiple re-quotes & adaptive settings
+async function performJupiterSwapExactIn(outMint: string, maxLamports: number): Promise<string | null> {
+  // protect against dust
+  if (maxLamports < 50_000) return null;
+
+  let attempt = 0;
+  const maxAttempts = 6;
+  let spendLamports = maxLamports;
+
+  while (attempt < maxAttempts) {
+    try {
+      // Re-check spendable balance each attempt & keep a small reserve.
+      const bal = await withConnRetries(c => c.getBalance(devWallet.publicKey, "confirmed"));
+      const reserve = Math.floor(0.005 * LAMPORTS_PER_SOL);
+      const capByBal = Math.max(0, Math.floor(bal * 0.9) - reserve);
+      spendLamports = Math.min(spendLamports, capByBal);
+      if (spendLamports < 50_000) return null;
+
+      // Adaptive slippage & amount trim per attempt.
+      const slippageBps = Math.min(1000 + attempt * 500, 4000); // 10% → 40% max for wild volatility
+      const trimmed = Math.floor(spendLamports * (1 - attempt * 0.03)); // trim 3% per retry
+      const toSpend = Math.max(trimmed, 50_000);
+
+      const quote = await jupQuoteSOLtoMint(outMint, toSpend, slippageBps);
+      const built = await jupBuildSwap(quote, devWallet.publicKey.toBase58());
+      const sig = await jupSendSignedSwap(built.swapTransaction);
+      return sig;
+    } catch (e: any) {
+      attempt++;
+      if (attempt >= maxAttempts) throw e;
+      await sleep(350 * attempt + Math.floor(Math.random() * 200));
+    }
+  }
+  return null;
+}
+
+// ================= Claim + Swap (T-60s) =================
 async function triggerClaimAndSwap90() {
   const cycleId = String(floorCycleStart().getTime());
   if (!PUMPORTAL_BASE || !PUMPORTAL_KEY) {
-    console.warn("[CLAIM] Skipping claim/swap; no PumpPortal creds.");
+    console.warn("[CLAIM] Skipping claim; no PumpPortal creds.");
     return { claimed: 0, swapSig: null, claimSig: null };
   }
 
-  // 1) Claim creator rewards (PumpPortal)
+  // 1) Claim via PumpPortal (with retries)
   const { res: claimRes, json: claimJson } = await withRetries(
     () => callPumportal(
       "/api/trade",
@@ -287,26 +326,29 @@ async function triggerClaimAndSwap90() {
   const claimUrl = claimSig ? `https://solscan.io/tx/${claimSig}` : null;
   console.log(`[CLAIM] ${claimed} SOL | ${claimUrl ?? "(no sig)"}`);
 
-  // 2) Swap 90% of claimed SOL to token via Jupiter
+  // 2) Swap 90% of claimed SOL → TRACKED_MINT via Jupiter (adaptive retries)
   let swapSig: string | null = null;
-  if (claimed > 0) {
-    const spendSol = Math.max(Number((claimed * 0.9).toFixed(6)), 0.0001);
-    try {
-      const quote = await withRetries(() => jupQuoteSOLtoMint(TRACKED_MINT, spendSol, 1000 /*10%*/ ), 4);
-      const built = await withRetries(() => jupBuildSwapTx(quote, devWallet.publicKey.toBase58()), 4);
-      const swapTxB64 = built?.swapTransaction;
-      if (!swapTxB64) throw new Error(`No swapTransaction in Jupiter response: ${JSON.stringify(built)}`);
-      swapSig = await withRetries(() => jupExecuteSwap(swapTxB64), 4);
-      console.log(`[SWAP] spent ~${spendSol} SOL → https://solscan.io/tx/${swapSig}`);
-    } catch (e: any) {
-      console.error("[SWAP ERROR]", e?.message || e);
+  const balLamports = await withConnRetries(c => c.getBalance(devWallet.publicKey, "confirmed"));
+  const reserveLamports = Math.floor(0.005 * LAMPORTS_PER_SOL); // keep ~0.005 SOL for fees
+  const maxSpendByBal = Math.max(0, Math.floor(balLamports * 0.9) - reserveLamports);
+  const maxSpendByClaim = Math.max(0, Math.floor(claimed * 0.9 * LAMPORTS_PER_SOL));
+  const spendLamports = Math.min(maxSpendByBal, maxSpendByClaim);
+
+  if (spendLamports >= 50_000) {
+    swapSig = await performJupiterSwapExactIn(TRACKED_MINT, spendLamports);
+    if (swapSig) {
+      console.log(`[SWAP] ${(spendLamports / LAMPORTS_PER_SOL).toFixed(6)} SOL → https://solscan.io/tx/${swapSig}`);
+    } else {
+      console.log("[SWAP] Skipped (insufficient after retries).");
     }
+  } else {
+    console.log("[SWAP] Skipped (spend too small).");
   }
 
   const now = new Date().toISOString();
   await recordOps({
-    lastClaim: { at: now, amount: claimed, tx: claimSig, url: claimSig ? `https://solscan.io/tx/${claimSig}` : null },
-    lastSwap:  { at: now, amount: null,   tx: swapSig,  url: swapSig ? `https://solscan.io/tx/${swapSig}` : null },
+    lastClaim: { at: now, amount: claimed, tx: claimSig, url: claimUrl },
+    lastSwap:  { at: now, amount: null,  tx: swapSig,  url: swapSig ? `https://solscan.io/tx/${swapSig}` : null },
   });
 
   return { claimed, swapSig, claimSig };
@@ -335,10 +377,10 @@ async function snapshotAndDistribute() {
 
   const holdersRaw = await getHoldersAll(TRACKED_MINT);
 
-  // Exclude > cap (default 50,000,000 UI units) — avoids LP/AMM vault whales
+  // Exclude > cap (default 50,000,000 UI units)
   const excluded = holdersRaw.filter(h => h.balance > AUTO_BLACKLIST_BALANCE);
   if (excluded.length > 0) {
-    console.log(`[SNAPSHOT] Excluded ${excluded.length} wallets over cap ${AUTO_BLACKLIST_BALANCE}`);
+    console.log(`[SNAPSHOT] Excluded ${excluded.length} wallets > ${AUTO_BLACKLIST_BALANCE}`);
   }
 
   const holders = holdersRaw.filter(h => h.balance <= AUTO_BLACKLIST_BALANCE);
