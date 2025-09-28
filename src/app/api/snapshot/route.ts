@@ -9,19 +9,21 @@ import { OPS, METRICS } from "@/lib/state";
 
 // ===== ENV =====
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
-const HELIUS_RPC = process.env.HELIUS_RPC || (HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "");
+const HELIUS_RPC =
+  process.env.HELIUS_RPC ||
+  (HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "");
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 
 const TRACKED_MINT       = process.env.TRACKED_MINT  || "D1GavULFQNrNVVsXkroLVH6obvn7QKBptcHJFH8Mpump";
 const REWARD_WALLET      = process.env.REWARD_WALLET || "DSDpdNq7JLZ3BpngQKs89G9SW3Ex86rHYKLzRgN2zEwS";
 const PUMPFUN_AMM_WALLET = process.env.PUMPFUN_AMM_WALLET || "";
 const TOKENS_PER_APE     = Number(process.env.TOKENS_PER_APE || 100_000);
-const AUTO_BLACKLIST_BALANCE =
-  Number(process.env.AUTO_BLACKLIST_BALANCE ?? 50_000_000);
+const AUTO_BLACKLIST_BALANCE = Number(process.env.AUTO_BLACKLIST_BALANCE ?? 50_000_000);
+
 // ===== Cache controls (server memory) =====
-const HOLDERS_TTL_MS = 5_000;      // holders cache TTL
-const MARKET_TTL_MS  = 3_000;      // market throttle
-const S_MAXAGE       = 5;          // CDN/browser freshness for the JSON
+const HOLDERS_TTL_MS = 5_000; // holders cache TTL
+const MARKET_TTL_MS  = 3_000; // market throttle
+const S_MAXAGE       = 5;     // CDN/browser freshness for the JSON
 const STALE_REVAL    = 25;
 
 // ===== Helpers =====
@@ -151,11 +153,11 @@ async function getHolders(mint: string): Promise<Holder[]> {
     let merged: Record<string, number> = {};
     try {
       const a = await byProgram("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", true);
-      for (const [k, v] of Object.entries(a)) merged[k] = (merged[k] ?? 0) + v;
+      for (const [k, v] of Object.entries(a)) merged[k] = (merged[k] ?? 0) + (v as number);
     } catch {}
     try {
       const b = await byProgram("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCx2w6G3W", false);
-      for (const [k, v] of Object.entries(b)) merged[k] = (merged[k] ?? 0) + v;
+      for (const [k, v] of Object.entries(b)) merged[k] = (merged[k] ?? 0) + (v as number);
     } catch {}
 
     const list = Object.entries(merged)
@@ -207,22 +209,34 @@ const pickNum = (...xs: any[]): number | null => {
   return null;
 };
 
-async function getPriceAndCap(mint: string, holdersForFallback?: Array<{ balance: number }>): Promise<{ price: number | null; cap: number | null }> {
+async function getPriceAndCap(
+  mint: string,
+  holdersForFallback?: Array<{ balance: number }>
+): Promise<{ price: number | null; cap: number | null }> {
   const now = Date.now();
-  if (MARKET.mint === mint && now - MARKET.ts < MARKET_TTL_MS) return { price: MARKET.price, cap: MARKET.cap };
-  if (MARKET.inflight) return MARKET.inflight;
+  if (MARKET.mint === mint && now - MARKET.ts < MARKET_TTL_MS)
+    return { price: MARKET.price, cap: MARKET.cap };
+  if (MARKET.inflight) return MARKET.inflight as Promise<{ price: number | null; cap: number | null }>;
 
-  const task = (async () => {
+  const task: Promise<{ price: number | null; cap: number | null }> = (async () => {
     try {
       // v3 market-data
-      const v3 = await getJson(`https://public-api.birdeye.so/defi/v3/token/market-data?address=${encodeURIComponent(mint)}&x-chain=solana`);
+      const v3 = await getJson(
+        `https://public-api.birdeye.so/defi/v3/token/market-data?address=${encodeURIComponent(
+          mint
+        )}&x-chain=solana`
+      );
       const d = v3.json?.data ?? {};
-      let cap   = pickNum(d.marketcap, d.market_cap, d.circulating_marketcap, d.marketCap);
+      let cap = pickNum(d.marketcap, d.market_cap, d.circulating_marketcap, d.marketCap);
       let price = pickNum(d.price, d.last_price, d.priceUsd, d.usd_price);
 
       // price-only fallback
       if (!price) {
-        const p = await getJson(`https://public-api.birdeye.so/defi/price?address=${encodeURIComponent(mint)}&include_liquidity=true`);
+        const p = await getJson(
+          `https://public-api.birdeye.so/defi/price?address=${encodeURIComponent(
+            mint
+          )}&include_liquidity=true`
+        );
         price = pickNum(p.json?.data?.value, p.json?.data?.price) ?? price;
       }
 
@@ -231,7 +245,10 @@ async function getPriceAndCap(mint: string, holdersForFallback?: Array<{ balance
         const supply = await getMintSupply(mint);
         if (supply && supply > 0) cap = price * supply;
         else if (holdersForFallback?.length) {
-          const approxCirc = holdersForFallback.reduce((a, r) => a + (Number(r.balance) || 0), 0);
+          const approxCirc = holdersForFallback.reduce(
+            (a, r) => a + (Number(r.balance) || 0),
+            0
+          );
           const computed = price * approxCirc;
           if (Number.isFinite(computed) && computed > 0) cap = computed;
         }
@@ -240,7 +257,7 @@ async function getPriceAndCap(mint: string, holdersForFallback?: Array<{ balance
       MARKET.ts = Date.now();
       MARKET.mint = mint;
       MARKET.price = price ?? MARKET.price ?? null;
-      MARKET.cap = (cap && cap > 0) ? cap : (MARKET.cap ?? null);
+      MARKET.cap = cap && cap > 0 ? cap : MARKET.cap ?? null;
 
       return { price: MARKET.price, cap: MARKET.cap };
     } finally {
@@ -255,18 +272,26 @@ async function getPriceAndCap(mint: string, holdersForFallback?: Array<{ balance
 // ===== GET handler =====
 export async function GET(req: Request) {
   if (!HELIUS_RPC) {
-    return new Response(JSON.stringify({ error: "Missing HELIUS_RPC/HELIUS_API_KEY" }), { status: 500 });
+    return new Response(
+      JSON.stringify({ error: "Missing HELIUS_RPC/HELIUS_API_KEY" }),
+      { status: 500 }
+    );
   }
 
   const url = new URL(req.url);
   const mintParam = url.searchParams.get("mint")?.trim();
-  const MINT = mintParam && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mintParam) ? mintParam : TRACKED_MINT;
+  const MINT =
+    mintParam && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mintParam)
+      ? mintParam
+      : TRACKED_MINT;
 
   try {
     const holdersRaw = await getHolders(MINT);
 
     // auto-blacklist wallets > threshold
-    const holders = holdersRaw.filter(h => Number(h.balance) <= AUTO_BLACKLIST_BALANCE);
+    const holders = holdersRaw.filter(
+      (h) => Number(h.balance) <= AUTO_BLACKLIST_BALANCE
+    );
 
     const [rewardPoolBanana, market] = await Promise.all([
       getRewardPoolAmount(MINT, REWARD_WALLET),
@@ -293,10 +318,12 @@ export async function GET(req: Request) {
       },
     });
   } catch (e: any) {
-    return new Response(JSON.stringify({ error: e?.message || "snapshot failed" }), {
-      status: 500,
-      headers: { "Cache-Control": "no-store" },
-    });
+    return new Response(
+      JSON.stringify({ error: e?.message || "snapshot failed" }),
+      {
+        status: 500,
+        headers: { "Cache-Control": "no-store" },
+      }
+    );
   }
 }
-
