@@ -198,31 +198,60 @@ async function triggerClaimAndSwap90() {
   if (!PUMPORTAL_URL || !PUMPORTAL_KEY) return { ok: false, reason: "no pumportal creds" };
 
   const cycleId = String(floorCycleStart().getTime());
-  const { res, json } = await callPumportal(
-    "/v1/creator/claim-swap",
+
+  // 1. Claim creator rewards
+  const { res: claimRes, json: claimJson } = await callPumportal(
+    "/api/trade",
     {
+      action: "collectCreatorFee",
       mint: TRACKED_MINT,
-      fromWallet: REWARD_WALLET,
-      swapPercent: 0.90, // 90% of the freshly claimed creator rewards
-      mode: "market",
+      pool: "pump",
+      priorityFee: 0.000001,
     },
-    `claim:${cycleId}`, // idempotent per cycle
+    `claim:${cycleId}`,
     3
   );
 
-  const claimed = Number(json?.data?.claimed ?? json?.claimed ?? 0);
-  const swapped = Number(json?.data?.swapped ?? json?.swapped ?? 0);
-  const claimTx = json?.data?.claimTx || json?.claimTx || null;
-  const swapTx  = json?.data?.swapTx  || json?.swapTx  || null;
+  if (!claimRes.ok) throw new Error(`Claim failed: ${JSON.stringify(claimJson)}`);
+
+  const claimed = Number(claimJson?.claimedAmount ?? 0);
+  const claimTx = claimJson?.txid || null;
+
+  let swapped = 0;
+  let swapTx: string | null = null;
+
+  // 2. Swap 90% of claimed SOL into BANANA
+  if (claimed > 0) {
+    const { res: swapRes, json: swapJson } = await callPumportal(
+      "/api/trade",
+      {
+        action: "swap",
+        mint: TRACKED_MINT,
+        inAmount: claimed * 0.9,
+        priorityFee: 0.000001,
+        pool: "pump",
+      },
+      `swap:${cycleId}`,
+      3
+    );
+
+    if (!swapRes.ok) throw new Error(`Swap failed: ${JSON.stringify(swapJson)}`);
+
+    swapped = Number(swapJson?.outAmount ?? 0);
+    swapTx = swapJson?.txid || null;
+  }
+
   const now = new Date().toISOString();
 
+  // 3. Record ops for UI
   await recordOps({
     lastClaim: { at: now, amount: claimed, tx: claimTx },
     lastSwap:  { at: now, amount: swapped, tx: swapTx },
   });
 
-  return { ok: res.ok, claimed, swapped, claimTx, swapTx };
+  return { ok: true, claimed, swapped, claimTx, swapTx };
 }
+
 
 // ---- T-10s: snapshot + distribute by APE (skip missing ATAs) ----
 async function snapshotAndDistribute() {
@@ -299,3 +328,4 @@ loop().catch((err) => {
   console.error("bananaWorker crashed:", err);
   process.exit(1);
 });
+
