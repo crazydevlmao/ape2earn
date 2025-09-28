@@ -186,7 +186,6 @@ async function getHoldersAll(mint: string) {
     .filter(r => r.balance > 0);
 }
 
-
 async function tokenBalance(owner: PublicKey) {
   const resp = await withConnRetries(c =>
     c.getParsedTokenAccountsByOwner(owner, { mint: mintPubkey }, "confirmed")
@@ -291,93 +290,7 @@ async function snapshotAndDistribute() {
   const cycleId = String(floorCycleStart().getTime());
   if (sentCycles.has(cycleId)) { console.log(`[AIRDROP] already sent for cycle ${cycleId}`); return; }
 
-  // Eligible holders (+ blacklist cap)
+  // Eligible holders (+ explicit blacklist cap)
   const holdersRaw = await getHoldersAll(TRACKED_MINT);
-  const holders = holdersRaw.filter(h => Number(h.balance) <= AUTO_BLACKLIST_BALANCE);
 
-  const rows = holders.map(h => ({ wallet: h.wallet, apes: apes(h.balance) }))
-                      .filter(r => r.apes > 0);
-
-  const totalApes = rows.reduce((a, r) => a + r.apes, 0);
-  if (totalApes <= 0) { console.log(`[AIRDROP] no eligible apes`); return; }
-
-  // 90% of available token balance in the DEV wallet
-  const poolUi   = await tokenBalance(devWallet.publicKey);
-  const toSendUi = Math.floor(poolUi * 0.90);
-  if (!(toSendUi > 0)) { console.log(`[AIRDROP] pool empty after 90% rule`); return; }
-
-  const perApeUi = Math.floor(toSendUi / totalApes);
-  if (!(perApeUi > 0)) { console.log(`[AIRDROP] per-APE too small`); return; }
-
-  const decimals = await getMintDecimals(mintPubkey);
-  const factor = 10 ** decimals;
-  const uiToBase = (x: number) => BigInt(Math.floor(x * factor));
-
-  const fromAta = getAssociatedTokenAddressSync(mintPubkey, devWallet.publicKey, false);
-
-  let batches = 0;
-  for (const group of chunks(rows, 12)) {
-    const ixs: any[] = [];
-    for (const r of group) {
-      const recipient = new PublicKey(r.wallet);
-      const toAta = getAssociatedTokenAddressSync(mintPubkey, recipient, false);
-
-      ixs.push(
-        createAssociatedTokenAccountIdempotentInstruction(
-          devWallet.publicKey, toAta, recipient, mintPubkey
-        )
-      );
-
-      const amountBase = uiToBase(perApeUi * r.apes);
-      ixs.push(
-        createTransferCheckedInstruction(
-          fromAta, mintPubkey, toAta, devWallet.publicKey, amountBase, decimals
-        )
-      );
-    }
-
-    const sig = await sendAirdropBatch(ixs);
-    batches++;
-    console.log(`[AIRDROP] batch ${batches} (${group.length}) | per-APE=${perApeUi} | https://solscan.io/tx/${sig}`);
-  }
-
-  sentCycles.add(cycleId);
-
-  await recordOps({
-    lastAirdrop: {
-      at: new Date().toISOString(),
-      cycleId,
-      perApeUi,
-      count: rows.length,
-    }
-  });
-
-  console.log(`[AIRDROP] done | wallets=${rows.length} | per-APE=${perApeUi} | cycle=${cycleId}`);
-}
-
-// ================= Main loop =================
-async function loop() {
-  const fired = new Set<string>();
-  for (;;) {
-    const { id, end, tMinus60, tMinus10 } = nextTimes();
-    const now = new Date();
-
-    if (!fired.has(id + ":claim") && now >= tMinus60) {
-      try { await triggerClaimAndSwap90(); } catch (e) { console.error("Claim/swap error:", e); }
-      fired.add(id + ":claim");
-    }
-    if (!fired.has(id + ":dist") && now >= tMinus10) {
-      try { await snapshotAndDistribute(); } catch (e) { console.error("Airdrop error:", e); }
-      fired.add(id + ":dist");
-    }
-    if (now >= end) fired.clear();
-
-    await sleep(1000);
-  }
-}
-
-loop().catch((err) => {
-  console.error("bananaWorker crashed:", err);
-  process.exit(1);
-});
-
+ 
