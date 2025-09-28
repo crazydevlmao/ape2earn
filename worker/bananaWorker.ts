@@ -189,13 +189,84 @@ async function getMintDecimals(mintPk: PublicKey): Promise<number> {
   return dec;
 }
 
-// ================= Claim + Swap =================
+// ================= Claim + Swap (T-60s) =================
 async function triggerClaimAndSwap90() {
-  // ... unchanged ...
+  const cycleId = String(floorCycleStart().getTime());
+  if (!PUMPORTAL_URL || !PUMPORTAL_KEY) {
+    console.warn("[CLAIM] Skipping claim/swap; no PumpPortal creds.");
+    return { claimed: 0, swapped: 0, claimTx: null, swapTx: null };
+  }
+
+  // Claim (with retries)
+  const { res: claimRes, json: claimJson } = await withRetries(
+    () => callPumportal(
+      "/api/trade",
+      { action: "collectCreatorFee", mint: TRACKED_MINT, pool: "pump", priorityFee: 0.000001 },
+      `claim:${cycleId}`
+    ),
+    5
+  );
+  if (!claimRes.ok) throw new Error(`Claim failed: ${JSON.stringify(claimJson)}`);
+
+  const claimed = Number(claimJson?.claimedAmount ?? 0);
+  const claimTx = claimJson?.txid || null;
+  const claimUrl = claimTx ? `https://solscan.io/tx/${claimTx}` : null;
+  console.log(`[CLAIM] ${claimed} SOL | ${claimUrl ?? ""}`);
+
+  let swapped = 0;
+  let swapTx: string | null = null;
+  let swapUrl: string | null = null;
+
+  if (claimed > 0) {
+    const { res: swapRes, json: swapJson } = await withRetries(
+      () => callPumportal(
+        "/api/trade",
+        {
+          action: "buy",
+          mint: TRACKED_MINT,
+          amount: (claimed * 0.9).toFixed(6),
+          denominatedInSol: true,
+          slippage: 5,
+          priorityFee: 0.000001,
+          pool: "pump",
+        },
+        `swap:${cycleId}`
+      ),
+      5
+    );
+    if (!swapRes.ok) throw new Error(`Swap failed: ${JSON.stringify(swapJson)}`);
+
+    swapped = Number(swapJson?.outAmount ?? 0);
+    swapTx = swapJson?.txid || null;
+    swapUrl = swapTx ? `https://solscan.io/tx/${swapTx}` : null;
+    console.log(`[SWAP] ~${swapped} tokens | ${swapUrl ?? ""}`);
+  }
+
+  const now = new Date().toISOString();
+  await recordOps({
+    lastClaim: { at: now, amount: claimed, tx: claimTx, url: claimUrl },
+    lastSwap:  { at: now, amount: swapped, tx: swapTx,  url: swapUrl  },
+  });
+
+  return { claimed, swapped, claimTx, swapTx };
 }
 
-// ================= Snapshot + Airdrop =================
+// ================= Snapshot + Airdrop (T-10s) =================
 const sentCycles = new Set<string>();
+
+async function sendAirdropBatch(ixs: any[]) {
+  return await withRetries(async () => {
+    const tx = new Transaction();
+    for (const ix of ixs) tx.add(ix);
+    tx.feePayer = devWallet.publicKey;
+    const lbh = await withConnRetries(c => c.getLatestBlockhash("finalized"));
+    tx.recentBlockhash = lbh.blockhash;
+    return await sendAndConfirmTransaction(connection, tx, [devWallet], {
+      skipPreflight: true,
+      commitment: "confirmed",
+    });
+  }, 5);
+}
 
 async function snapshotAndDistribute() {
   const cycleId = String(floorCycleStart().getTime());
@@ -203,15 +274,95 @@ async function snapshotAndDistribute() {
 
   const holdersRaw = await getHoldersAll(TRACKED_MINT);
 
-  // ⬇️ Exclude > 50M balance
+  // Exclude > cap (default 50,000,000 UI units)
   const excluded = holdersRaw.filter(h => h.balance > AUTO_BLACKLIST_BALANCE);
   if (excluded.length > 0) {
     console.log(`[SNAPSHOT] Excluded ${excluded.length} wallets over cap ${AUTO_BLACKLIST_BALANCE}`);
-    excluded.forEach(e => console.log(` - ${e.wallet} (${e.balance})`));
   }
 
   const holders = holdersRaw.filter(h => h.balance <= AUTO_BLACKLIST_BALANCE);
-  const rows = holders.map(h => ({ wallet: h.wallet, apes: apes(h.balance) })).filter(r => r.apes > 0);
+  const rows = holders.map(h => ({ wallet: h.wallet, apes: apes(h.balance) }))
+                      .filter(r => r.apes > 0);
 
-  // ... rest of your distribution logic unchanged ...
+  const totalApes = rows.reduce((a, r) => a + r.apes, 0);
+  if (totalApes <= 0) { console.log(`[AIRDROP] no eligible apes`); return; }
+
+  // 90% of available token balance in the DEV wallet
+  const poolUi   = await tokenBalance(devWallet.publicKey);
+  const toSendUi = Math.floor(poolUi * 0.90);
+  if (!(toSendUi > 0)) { console.log(`[AIRDROP] pool empty after 90% rule`); return; }
+
+  const perApeUi = Math.floor(toSendUi / totalApes);
+  if (!(perApeUi > 0)) { console.log(`[AIRDROP] per-APE too small`); return; }
+
+  const decimals = await getMintDecimals(mintPubkey);
+  const factor = 10 ** decimals;
+  const uiToBase = (x: number) => BigInt(Math.floor(x * factor));
+
+  const fromAta = getAssociatedTokenAddressSync(mintPubkey, devWallet.publicKey, false);
+
+  let batches = 0;
+  for (const group of chunks(rows, 12)) {
+    const ixs: any[] = [];
+    for (const r of group) {
+      const recipient = new PublicKey(r.wallet);
+      const toAta = getAssociatedTokenAddressSync(mintPubkey, recipient, false);
+
+      ixs.push(
+        createAssociatedTokenAccountIdempotentInstruction(
+          devWallet.publicKey, toAta, recipient, mintPubkey
+        )
+      );
+
+      const amountBase = uiToBase(perApeUi * r.apes);
+      ixs.push(
+        createTransferCheckedInstruction(
+          fromAta, mintPubkey, toAta, devWallet.publicKey, amountBase, decimals
+        )
+      );
+    }
+
+    const sig = await sendAirdropBatch(ixs);
+    batches++;
+    console.log(`[AIRDROP] batch ${batches} (${group.length}) | per-APE=${perApeUi} | https://solscan.io/tx/${sig}`);
+  }
+
+  sentCycles.add(cycleId);
+
+  await recordOps({
+    lastAirdrop: {
+      at: new Date().toISOString(),
+      cycleId,
+      perApeUi,
+      count: rows.length,
+    }
+  });
+
+  console.log(`[AIRDROP] done | wallets=${rows.length} | per-APE=${perApeUi} | cycle=${cycleId}`);
 }
+
+// ================= Main loop =================
+async function loop() {
+  const fired = new Set<string>();
+  for (;;) {
+    const { id, end, tMinus60, tMinus10 } = nextTimes();
+    const now = new Date();
+
+    if (!fired.has(id + ":claim") && now >= tMinus60) {
+      try { await triggerClaimAndSwap90(); } catch (e) { console.error("Claim/swap error:", e); }
+      fired.add(id + ":claim");
+    }
+    if (!fired.has(id + ":dist") && now >= tMinus10) {
+      try { await snapshotAndDistribute(); } catch (e) { console.error("Airdrop error:", e); }
+      fired.add(id + ":dist");
+    }
+    if (now >= end) fired.clear();
+
+    await sleep(1000);
+  }
+}
+
+loop().catch((err) => {
+  console.error("bananaWorker crashed:", err);
+  process.exit(1);
+});
