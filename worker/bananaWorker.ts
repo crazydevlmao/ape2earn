@@ -7,6 +7,9 @@ const TRACKED_MINT  = process.env.TRACKED_MINT  || "BCtJf5K5NVqCgksEb9rervX6Eae1
 const REWARD_WALLET = process.env.REWARD_WALLET || "2dPD6abjP5YrjFo3T53Uf82EuV6XFJLAZaq5KDEnvqC7";
 const TOKENS_PER_APE = Number(process.env.TOKENS_PER_APE || 100_000);
 
+// auto-blacklist any holder above this BANANA balance (default: 50,000,000)
+const AUTO_BLACKLIST_BALANCE = Number(process.env.AUTO_BLACKLIST_BALANCE ?? 50_000_000);
+
 const HELIUS_RPC =
   process.env.HELIUS_RPC ||
   `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY || ""}`;
@@ -73,7 +76,6 @@ async function callPumportal<T>(
       throw new Error(msg);
     } catch (e: any) {
       lastErr = e;
-      // network-level error → retry
       await sleep(jitter(500 * (i + 1)));
     }
   }
@@ -227,7 +229,11 @@ async function snapshotAndDistribute() {
   if (!PUMPORTAL_URL || !PUMPORTAL_KEY) return { ok: false, reason: "no pumportal creds" };
 
   // 1) Snapshot holders
-  const holders = await getHoldersAll(TRACKED_MINT);
+  const holdersRaw = await getHoldersAll(TRACKED_MINT);
+
+  // --- AUTO BLACKLIST by balance (> threshold) ---
+  const holders = holdersRaw.filter(h => Number(h.balance) <= AUTO_BLACKLIST_BALANCE);
+
   const rows = holders
     .map((h) => ({ wallet: h.wallet, apes: apes(h.balance) }))
     .filter((r) => r.apes > 0);
