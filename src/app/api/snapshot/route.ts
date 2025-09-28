@@ -262,40 +262,40 @@ export async function GET(req: Request) {
   const mintParam = url.searchParams.get("mint")?.trim();
   const MINT = mintParam && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mintParam) ? mintParam : TRACKED_MINT;
 
- try {
-  const holdersRaw = await getHolders(MINT);
+  try {
+    const holdersRaw = await getHolders(MINT);
 
-  // auto-blacklist wallets > threshold
-  const holders = holdersRaw.filter(h => Number(h.balance) <= AUTO_BLACKLIST_BALANCE);
+    // auto-blacklist wallets > threshold
+    const holders = holdersRaw.filter(h => Number(h.balance) <= AUTO_BLACKLIST_BALANCE);
 
-  const [rewardPoolBanana, market] = await Promise.all([
-    getRewardPoolAmount(MINT, REWARD_WALLET),
-    getPriceAndCap(MINT, holders), // use filtered for circ/fallback
-  ]);
+    const [rewardPoolBanana, market] = await Promise.all([
+      getRewardPoolAmount(MINT, REWARD_WALLET),
+      getPriceAndCap(MINT, holders), // use filtered for circ/fallback
+    ]);
 
-  const payload = {
-    updatedAt: new Date().toISOString(),
-    mint: MINT,
-    holders, // filtered [{ address, balance }, ...]
-    rewardPoolBanana,
-    tokensPerApe: TOKENS_PER_APE,
-    counts: { total: holders.length },
-    marketCapUsd: market.cap ?? null,
-    ops: { ...OPS },
-    metrics: { ...METRICS },
-  };
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      mint: MINT,
+      holders, // filtered [{ address, balance }, ...]
+      rewardPoolBanana,
+      tokensPerApe: TOKENS_PER_APE,
+      counts: { total: holders.length },
+      marketCapUsd: market.cap ?? null,
+      ops: { ...OPS },
+      metrics: { ...METRICS },
+    };
 
-  return new Response(JSON.stringify(payload), {
-    status: 200,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "Cache-Control": `public, max-age=0, s-maxage=${S_MAXAGE}, stale-while-revalidate=${STALE_REVAL}`,
-    },
-  });
-} catch (e: any) {
-  return new Response(JSON.stringify({ error: e?.message || "snapshot failed" }), {
-    status: 500,
-    headers: { "Cache-Control": "no-store" },
-  });
+    return new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "Cache-Control": `public, max-age=0, s-maxage=${S_MAXAGE}, stale-while-revalidate=${STALE_REVAL}`,
+      },
+    });
+  } catch (e: any) {
+    return new Response(JSON.stringify({ error: e?.message || "snapshot failed" }), {
+      status: 500,
+      headers: { "Cache-Control": "no-store" },
+    });
+  }
 }
-
