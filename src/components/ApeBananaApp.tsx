@@ -2,23 +2,25 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-// ================== UI CONFIG (unchanged visuals) ==================
-const APE_UNIT = 100_000; // 1 APE = 100,000 $BANANA
-const CYCLE_MINUTES = 10;
-const USE_CEIL_FOR_APES = false; // always round DOWN per your request
+// ================== UI CONFIG ==================
+const APE_UNIT = 100_000;          // 1 APE = 100,000 $BANANA
+const CYCLE_MINUTES = 5;
+const USE_CEIL_FOR_APES = false;   // round DOWN
 
 // ================== TYPES ==================
 type Holder = { wallet: string; balance: number };
 type Row = { wallet: string; tokens: number; apes: number };
-// Market cap payload from server
 type MarketInfo = { marketCapUsd: number | null };
+type OpsState = {
+  lastClaim: { at: string; amount: number; tx: string | null } | null;
+  lastSwap:  { at: string; amount: number; tx: string | null } | null;
+};
 
 // ================== HELPERS ==================
 function toNum(n: unknown, fallback = 0): number {
   const v = Number(n);
   return Number.isFinite(v) ? v : fallback;
 }
-// Parse a possibly-string number into a real number, else null
 function numOrNull(n: unknown): number | null {
   const v = Number(n);
   return Number.isFinite(v) ? v : null;
@@ -28,7 +30,7 @@ function apesForHolder(tokens: number) {
   if (t <= 0) return 0;
   return USE_CEIL_FOR_APES ? Math.ceil(t / APE_UNIT) : Math.floor(t / APE_UNIT);
 }
-function nextTenMinuteBoundary(from = new Date()) {
+function nextCycleBoundary(from = new Date()) {
   const d = new Date(from);
   d.setSeconds(0, 0);
   const minutes = d.getMinutes();
@@ -42,14 +44,10 @@ function formatHMS(msRemaining: number) {
   const ss = s % 60;
   return `${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
 }
-
-// Shorten a long address (e.g., mint) for UI
 function shortAddr(a?: string, head = 6, tail = 6) {
   const s = String(a || '');
   return s.length > head + tail ? `${s.slice(0, head)}…${s.slice(-tail)}` : s;
 }
-
-// Split display to highlight a trailing "pump"
 function splitPumpDisplay(m: string) {
   const mint = String(m || '');
   const endsPump = mint.toLowerCase().endsWith('pump');
@@ -60,8 +58,6 @@ function splitPumpDisplay(m: string) {
   }
   return { head: shortAddr(mint), pump: '' };
 }
-
-// Clipboard helper with fallback (works on HTTP dev + older browsers)
 async function copyToClipboard(text: string): Promise<boolean> {
   try {
     if (navigator.clipboard?.writeText) {
@@ -82,6 +78,9 @@ async function copyToClipboard(text: string): Promise<boolean> {
     return ok;
   } catch {}
   return false;
+}
+function solscanTx(tx?: string | null) {
+  return tx ? `https://solscan.io/tx/${tx}` : null;
 }
 
 // ================== UI PARTS ==================
@@ -127,8 +126,6 @@ const StatCard: React.FC<{label:string; value:React.ReactNode; tooltip?: { title
   </div>
 );
 
-// Contract Address pill for header (always renders; shows placeholder while loading)
-// Contract Address pill for header (always renders; shows placeholder while loading)
 const CAHeaderPill: React.FC<{ mint: string; copied: boolean; onCopy: () => void }> = ({ mint, copied, onCopy }) => {
   const sp = splitPumpDisplay(mint);
   const shown = !!(mint && mint.length > 0);
@@ -160,7 +157,6 @@ const CAHeaderPill: React.FC<{ mint: string; copied: boolean; onCopy: () => void
   );
 };
 
-// Single horizontal rectangle for Market Cap with delta arrow
 const MarketCapStrip: React.FC<{ valueUsd: number | null; delta?: number | null }> = ({ valueUsd, delta }) => {
   function compact(n: number) {
     try { return Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(n); } catch { return n.toLocaleString(); }
@@ -170,8 +166,6 @@ const MarketCapStrip: React.FC<{ valueUsd: number | null; delta?: number | null 
   return (
     <div className="relative rounded-2xl border-2 border-yellow-300 bg-white px-4 py-3 shadow-[0_8px_0_#facc15] overflow-visible">
       <div className="absolute inset-0 opacity-60 pointer-events-none" style={{ background: 'linear-gradient(90deg, rgba(250, 204, 21, 0.12), transparent 55%)' }} />
-
-      {/* Header row like other stat cards: label left, info dot top-right */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <PulsingDot />
@@ -179,8 +173,6 @@ const MarketCapStrip: React.FC<{ valueUsd: number | null; delta?: number | null 
         </div>
         <InfoDot title="Market Cap?" body={"If you really need this explained, stay away from trading at all costs 😅"} />
       </div>
-
-      {/* Value + delta */}
       <div className="mt-1 flex items-baseline gap-3">
         <div className="text-2xl font-black text-yellow-600 tabular-nums tracking-wide" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>{txt}</div>
         {deltaTxt && (
@@ -221,22 +213,19 @@ const NextDropCard: React.FC<{ msLeft:number; cycleMs:number }> = ({ msLeft, cyc
   const progress = 1 - Math.min(1, Math.max(0, toNum(msLeft, 0) / cycleMs));
   const offset = dash * (1 - progress);
 
-  // Banana rain (soft, random, not too fast)
   const drops = React.useMemo(() => {
-    const N = 10; // number of bananas raining
+    const N = 10;
     return Array.from({ length: N }, (_, i) => ({
       id: i,
-      left: Math.max(2, Math.min(98, Math.random() * 100)), // % across width
-      delay: Math.random() * 2.5, // staggered
-      duration: 5 + Math.random() * 4, // 5–9s per fall (smooth)
+      left: Math.max(2, Math.min(98, Math.random() * 100)),
+      delay: Math.random() * 2.5,
+      duration: 5 + Math.random() * 4,
     }));
   }, []);
 
   return (
     <motion.div key={Math.floor(toNum(msLeft, 0)/1000)} initial={{scale:0.98, filter:'drop-shadow(0 0 0 rgba(250,204,21,0))'}} animate={{scale:1, filter:'drop-shadow(0 0 12px rgba(250,204,21,0.35))'}} transition={{type:'spring', stiffness:200, damping:20}} className="relative flex items-center justify-center rounded-2xl border-2 border-yellow-300 bg-white p-4 shadow-[0_8px_0_#facc15]">
       <div className="absolute inset-0 rounded-2xl bg-[radial-gradient(closest-side,rgba(250,204,21,0.12),transparent)]" />
-
-      {/* Banana rain overlay */}
       <div aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden">
         {drops.map((d) => (
           <motion.img
@@ -276,8 +265,13 @@ export default function ApeBananaApp() {
   const lastMCRef = useRef<number | null>(null);
   const [mcDelta, setMcDelta] = useState<number | null>(null);
   const [copiedCA, setCopiedCA] = useState(false);
+  const [ops, setOps] = useState<OpsState>({ lastClaim: null, lastSwap: null });
 
-  // ONE call (server caches it) — same pattern as GPU site
+  // celebration toast control
+  const [celebrate, setCelebrate] = useState(false);
+  const cycleIdRef = useRef<number | null>(null);
+
+  // Poll snapshot (server caches; users hit only this)
   useEffect(() => {
     let alive = true;
     const load = async () => {
@@ -287,7 +281,7 @@ export default function ApeBananaApp() {
         if (res.ok) {
           const j = await res.json();
           const hs: Holder[] = Array.isArray(j?.holders)
-            ? j.holders.map((x: any) => ({ wallet: String(x.address ?? x.wallet ?? ''), balance: toNum(x.balance, 0) }))
+            ? j.holders.map((x: { address?: string; wallet?: string; balance?: number | string }) => ({ wallet: String(x.address ?? x.wallet ?? ''), balance: toNum(x.balance, 0) }))
             : [];
           setHolders(hs);
           setPool(toNum(j?.rewardPoolBanana, 0));
@@ -296,18 +290,18 @@ export default function ApeBananaApp() {
           setMcDelta(mc != null && lastMCRef.current != null ? mc - lastMCRef.current : null);
           setMarket({ marketCapUsd: mc });
           lastMCRef.current = mc ?? lastMCRef.current;
-          if (process.env.NODE_ENV !== 'production') console.debug('snapshot.marketCapUsd raw =>', j?.marketCapUsd, 'parsed =>', mc);
+          if (j?.ops) setOps(j.ops);
         } else {
-          // fail-open with safe defaults
           setHolders([]);
           setPool(0);
           setMarket({ marketCapUsd: null });
+          setOps({ lastClaim: null, lastSwap: null });
         }
       } catch {
-        // network error — keep UI responsive with safe defaults
         setHolders([]);
         setPool(0);
         setMarket({ marketCapUsd: null });
+        setOps({ lastClaim: null, lastSwap: null });
       }
     };
     load();
@@ -319,7 +313,7 @@ export default function ApeBananaApp() {
 
   const safe = Array.isArray(holders) ? holders : [];
 
-  // Build sorted rows + global rank
+  // Build sorted rows + rank
   const enriched = useMemo(() => {
     const rows: Row[] = safe
       .map((h) => ({ wallet: h.wallet, tokens: toNum(h.balance, 0), apes: apesForHolder(toNum(h.balance, 0)) }))
@@ -335,12 +329,12 @@ export default function ApeBananaApp() {
     return m;
   }, [enriched.rows]);
 
-  // Search + dynamic page size (auto-fit, no internal scroll)
+  // Table paging
   const [query, setQuery] = useState('');
   const [page, setPage] = useState(1);
   const tableBoxRef = useRef<HTMLDivElement | null>(null);
   const tbodyRef = useRef<HTMLTableSectionElement | null>(null);
-  const [rowsPerPage, setRowsPerPage] = useState<number>(8); // fallback
+  const [rowsPerPage, setRowsPerPage] = useState<number>(8);
 
   const filtered = useMemo(
     () => enriched.rows.filter((r) => (query ? r.wallet.toLowerCase().includes(query.toLowerCase()) : true)),
@@ -350,8 +344,8 @@ export default function ApeBananaApp() {
   useEffect(() => {
     const recalc = () => {
       const box = tableBoxRef.current; if (!box) return;
-      const h = box.clientHeight; // table viewport height
-      const headerH = 36; // approx header height
+      const h = box.clientHeight;
+      const headerH = 36;
       const firstRow = tbodyRef.current?.querySelector('tr');
       let rowH = firstRow ? Math.ceil(firstRow.getBoundingClientRect().height) : 42;
       if (!Number.isFinite(rowH) || rowH <= 0) rowH = 42;
@@ -371,54 +365,49 @@ export default function ApeBananaApp() {
   const start = (page - 1) * Math.max(1, rowsPerPage);
   const pageRows = filtered.slice(start, start + Math.max(1, rowsPerPage));
 
-  // Countdown
-  const [target, setTarget] = useState(() => nextTenMinuteBoundary());
+  // Countdown + celebration
+  const [target, setTarget] = useState(() => nextCycleBoundary());
   const [now, setNow] = useState(new Date());
   useEffect(() => { const t = setInterval(() => setNow(new Date()), 250); return () => clearInterval(t); }, []);
   const msLeft = Math.max(0, target.getTime() - now.getTime());
-  useEffect(() => { if (msLeft <= 0) setTarget(nextTenMinuteBoundary()); }, [msLeft]);
+  useEffect(() => {
+    // Trigger celebration ONCE when hitting 0 for the current target
+    const id = target.getTime();
+    if (msLeft === 0 && cycleIdRef.current !== id) {
+      cycleIdRef.current = id;
+      setCelebrate(true);
+      const to = setTimeout(() => setCelebrate(false), 3000); // 3s
+      return () => clearTimeout(to);
+    }
+    if (msLeft <= 0) setTarget(nextCycleBoundary());
+  }, [msLeft, target]);
   const cycleMs = CYCLE_MINUTES * 60 * 1000;
 
   const estPerApe = enriched.totalApes ? Math.floor(toNum(pool, 0) / enriched.totalApes) : 0;
   const isLoading = holders === null;
 
-  // ===== Mini self-checks (dev tests) =====
-  function runDevChecks() {
-    try {
-      console.groupCollapsed('ApeBanana self-checks');
-      // APE rounding
-      console.assert(apesForHolder(10865369.856) === 108, 'floor rounding for APEs');
-      console.assert(apesForHolder(NaN) === 0, 'NaN -> 0 APEs');
-      console.assert(apesForHolder(-1) === 0, 'negative -> 0 APEs');
-      // string-to-number helper
-      console.assert(numOrNull('123.45') === 123.45, 'numOrNull parses numeric strings');
-      console.assert(numOrNull('foo') === null, 'numOrNull returns null for non-numbers');
-      // shortAddr helper
-      console.assert(shortAddr('ABCDEFGH1234567890', 3, 3) === 'ABC…890', 'shortAddr works');
-      // splitPumpDisplay
-      const sp = splitPumpDisplay('abcdefpump');
-      console.assert(sp.pump === 'pump' && sp.head.length > 0, 'splitPumpDisplay isolates pump suffix');
-      // time helpers
-      const t = nextTenMinuteBoundary(new Date('2025-01-01T12:07:33Z'));
-      console.assert(t.getUTCMinutes() % 10 === 0, 'nextTenMinuteBoundary aligns on 10s');
-      console.assert(formatHMS(61_000) === '01:01', 'formatHMS 61s');
-      console.assert(formatHMS(-5_000) === '00:00', 'formatHMS clamps negative');
-      // table paging math stable for empty
-      (function pagingTest(){
-        const total = 0, rpp = 8;
-        const maxPg = Math.max(1, Math.ceil(total / Math.max(1, rpp)));
-        console.assert(maxPg === 1, 'paging maxPage fallback for 0 rows');
-      })();
-      console.groupEnd();
-    } catch {}
-  }
-  useEffect(() => { if (typeof window !== 'undefined') setTimeout(runDevChecks, 0); }, []);
-
   return (
     <div className="h-screen w-full bg-white text-neutral-900 md:overflow-hidden overflow-y-auto">
+      {/* Celebration Toast over the logo */}
+      <AnimatePresence>
+        {celebrate && (
+          <motion.div
+            initial={{ y: -40, opacity: 0, scale: 0.8, rotate: -3 }}
+            animate={{ y: 0, opacity: 1, scale: 1, rotate: 0 }}
+            exit={{ y: -40, opacity: 0, scale: 0.9, rotate: 3 }}
+            transition={{ type: 'spring', stiffness: 600, damping: 28 }}
+            className="fixed top-3 left-1/2 -translate-x-1/2 z-[60]"
+          >
+            <div className="rounded-2xl border-2 border-yellow-400 bg-yellow-300 px-4 py-2 shadow-[0_8px_0_#facc15] text-black font-black"
+                 style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>
+              Apes are receiving their $BANANA! 🍌
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Header */}
-      <div className="sticky top-0 z-30 grid grid-cols-[1fr_auto_1fr] items-center border-b border-yellow-200/80 bg-white/90 px-4 py-3 backdrop-blur">
-        {/* Left: CA pill with copy (always rendered) */}
+      <div className="sticky top-0 z-50 grid grid-cols-[1fr_auto_1fr] items-center border-b border-yellow-200/80 bg-white/90 px-4 py-3 backdrop-blur">
         <div className="flex items-center gap-2">
           <CAHeaderPill
             mint={mint}
@@ -442,39 +431,79 @@ export default function ApeBananaApp() {
 
       {/* Body grid */}
       <div className="mx-auto grid h-[calc(100vh-64px-48px)] max-w-6xl grid-cols-1 gap-4 px-4 py-4 sm:grid-cols-12 relative">
-        {/* vertical split line (faded ends) */}
-        <div className="pointer-events-none hidden sm:block absolute inset-y-2 w-px opacity-70" style={{ left: '41.666%', background: 'linear-gradient(180deg, transparent 0%, #fde047 35%, #fde047 65%, transparent 100%)' }} />
+        {/* vertical accent line */}
+        <div className="pointer-events-none hidden sm:block absolute inset-y-2 w-px opacity-70"
+             style={{ left: '41.666%', background: 'linear-gradient(180deg, transparent 0%, #fde047 35%, #fde047 65%, transparent 100%)' }} />
 
         {/* Left column */}
         <div className="sm:col-span-5 flex flex-col gap-4">
           <NextDropCard msLeft={msLeft} cycleMs={cycleMs} />
+
           <div className="grid grid-cols-2 gap-3 relative">
-            {/* faint vertical divider between stat columns */}
-            <div className="pointer-events-none absolute inset-y-1 left-1/2 -translate-x-1/2 w-px opacity-60 hidden sm:block" style={{ background: 'linear-gradient(180deg, transparent, #fde047, transparent)' }} />
+            <div className="pointer-events-none absolute inset-y-1 left-1/2 -translate-x-1/2 w-px opacity-60 hidden sm:block"
+                 style={{ background: 'linear-gradient(180deg, transparent, #fde047, transparent)' }} />
             <StatCard
               label="Total Apes"
               value={enriched.totalApes.toLocaleString()}
-              tooltip={{ title: 'APE definition', body: 'Your APEs = floor($BANANA / 100,000). APEs determine your share of each 10-minute drop.' }}
+              tooltip={{ title: 'APE definition', body: 'Your APEs = floor($BANANA / 100,000). APEs determine your share of each 5-minute drop.' }}
             />
             <StatCard
               label="Reward Pool ($BANANA)"
               value={pool == null ? '--' : Math.floor(toNum(pool, 0)).toLocaleString()}
-              tooltip={{ title: 'Buyback pool', body: '100% of creator rewards are used to buy back $BANANA before each 10-minute drop. Snapshot may occur at any random moment within each 10-minute window.' }}
+              tooltip={{ title: 'Buyback pool', body: 'Creator rewards are used to buy back $BANANA before each 5-minute drop. Snapshot can occur at a random moment within the window.' }}
             />
             <StatCard
               label="Est. per APE ($BANANA)"
               value={enriched.totalApes ? estPerApe.toLocaleString() : '--'}
-              tooltip={{ title: 'Estimation', body: 'Estimated drop per APE = Reward Pool / Total Apes (snapshot at a random moment in each 10-minute window).' }}
+              tooltip={{ title: 'Estimation', body: 'Estimated drop per APE = Reward Pool / Total Apes (actual distribution at T−10s based on APEs).' }}
             />
             <StatCard
               label="Cycle Length"
               value={`${CYCLE_MINUTES} min`}
-              tooltip={{ title: 'Cycle', body: 'A new drop happens at :00, :10, :20, :30, :40, and :50 every hour.' }}
+              tooltip={{ title: 'Cycle', body: 'A new drop happens every 5 minutes.' }}
             />
           </div>
 
           {/* Market Cap strip */}
           <MarketCapStrip valueUsd={market.marketCapUsd} delta={mcDelta} />
+
+          {/* ====== NEW: Ops blocks below Market Cap ====== */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="relative rounded-2xl border-2 border-yellow-300 bg-white px-4 py-3 shadow-[0_6px_0_#facc15]">
+              <div className="flex items-center justify-between">
+                <div className="text-[10px] uppercase tracking-widest text-neutral-500/80">Latest Creator Rewards Claim</div>
+              </div>
+              <div className="mt-1 text-2xl font-black text-yellow-600 tabular-nums" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>
+                {ops?.lastClaim ? Math.floor(ops.lastClaim.amount).toLocaleString() : '--'}
+              </div>
+              <div className="mt-1 text-xs">
+                {ops?.lastClaim?.tx ? (
+                  <a className="underline hover:no-underline" href={solscanTx(ops.lastClaim.tx)!} target="_blank" rel="noopener noreferrer">
+                    View on Solscan
+                  </a>
+                ) : <span className="text-neutral-400">No tx yet</span>}
+                {ops?.lastClaim?.at && <span className="opacity-60"> • {new Date(ops.lastClaim.at).toLocaleTimeString()}</span>}
+              </div>
+            </div>
+
+            <div className="relative rounded-2xl border-2 border-yellow-300 bg-white px-4 py-3 shadow-[0_6px_0_#facc15]">
+              <div className="flex items-center justify-between">
+                <div className="text-[10px] uppercase tracking-widest text-neutral-500/80">Latest $BANANA Swap</div>
+              </div>
+              <div className="mt-1 text-2xl font-black text-yellow-600 tabular-nums" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>
+                {ops?.lastSwap ? Math.floor(ops.lastSwap.amount).toLocaleString() : '--'}
+              </div>
+              <div className="mt-1 text-xs">
+                {ops?.lastSwap?.tx ? (
+                  <a className="underline hover:no-underline" href={solscanTx(ops.lastSwap.tx)!} target="_blank" rel="noopener noreferrer">
+                    View on Solscan
+                  </a>
+                ) : <span className="text-neutral-400">No tx yet</span>}
+                {ops?.lastSwap?.at && <span className="opacity-60"> • {new Date(ops.lastSwap.at).toLocaleTimeString()}</span>}
+              </div>
+            </div>
+          </div>
+          {/* ====== /Ops blocks ====== */}
         </div>
 
         {/* Right column */}
@@ -482,16 +511,15 @@ export default function ApeBananaApp() {
           <div className="rounded-2xl border-2 border-yellow-200 bg-white p-4 shadow-[0_6px_0_#fde68a]">
             <div className="mb-2 flex items-center gap-2"><PulsingDot /><div className="text-sm font-black" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>How it works?</div></div>
             <ul className="list-disc pl-5 text-base text-neutral-700 leading-7">
-              <li>Every <b>10 minutes</b>, 100% of creator rewards are used to <b>buy back $BANANA</b> and <b>drop</b> it to Apes. Buybacks are randomized to help prevent front‑running.</li>
+              <li>Every <b>5 minutes</b>, creator rewards are claimed at <b>T−1m</b>, 90% is swapped into $BANANA, then a snapshot is taken at <b>T−10s</b>.</li>
               <li><b>1 APE = {APE_UNIT.toLocaleString()} $BANANA</b>. Your APEs = <b>floor</b>(your $BANANA / {APE_UNIT.toLocaleString()}).</li>
-              <li>Ape weight scales linearly with your APEs. More APEs → bigger share of the drop.</li>
-              <li>Hover the <b>i</b> icons to see cycle and rules details.</li>
+              <li>Distribution is proportional to <b>APEs</b>. Wallets without an open $BANANA token account (ATA) are skipped.</li>
             </ul>
           </div>
 
           <div className="flex-1 min-h-0 rounded-2xl border-2 border-yellow-300 bg-white p-4 shadow-[0_8px_0_#facc15]">
             <div className="mb-3 flex items-center justify-between gap-3">
-              <div className="flex items-center gap-2"><PulsingDot /><div className="text-sm font-black" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>Top Apes</div></div>
+              <div className="flex items-center gap-2"><PulsingDot /><div className="text-sm font-black" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>Apelist</div></div>
               <div className="flex items-center gap-2"><PixelInput placeholder="Search wallet…" value={query} onChange={(e) => setQuery(e.target.value)} /></div>
             </div>
 
