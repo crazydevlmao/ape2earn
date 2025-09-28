@@ -542,7 +542,7 @@ const loadRef = useRef<() => Promise<void>>(async () => {});
           <div className="rounded-2xl border-2 border-yellow-200 bg-white p-4 shadow-[0_6px_0_#fde68a]">
             <div className="mb-2 flex items-center gap-2"><PulsingDot /><div className="text-sm font-black" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>How it works?</div></div>
             <ul className="list-disc pl-5 text-base text-neutral-700 leading-7">
-              <li>Every <b>5 minutes</b>, creator rewards are claimed (T−1m), swapped 90% into $BANANA, then a snapshot is taken at <b>T−10s</b>.</li>
+              <li>Every <b>5 minutes</b>, creator rewards are claimed, swapped into $BANANA, then a snapshot is taken at <b>T−30/-10s</b>.</li>
               <li><b>1 APE = {APE_UNIT.toLocaleString()} $BANANA</b>. Your APEs = <b>floor</b>(your $BANANA / {APE_UNIT.toLocaleString()}).</li>
               <li>Distribution is proportional to <b>APEs</b>. Wallets without an open $BANANA token account (ATA) are skipped.</li>
             </ul>
@@ -611,4 +611,5 @@ const loadRef = useRef<() => Promise<void>>(async () => {});
     </div>
   );
 }
+
 
