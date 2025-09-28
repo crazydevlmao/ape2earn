@@ -8,7 +8,6 @@ import {
   Transaction,
   VersionedTransaction,
   sendAndConfirmTransaction,
-  LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
 import {
   getAssociatedTokenAddressSync,
@@ -31,20 +30,21 @@ const HELIUS_RPC =
   `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY || ""}`;
 const QUICKNODE_RPC = process.env.QUICKNODE_RPC || ""; // optional failover
 
-// === PumpPortal (claim only) ===
+// PumpPortal for CLAIM ONLY (host normalized)
 const PUMP_HOST = "pumpportal.fun";
 const RAW_PUMPORTAL_URL = (process.env.PUMPORTAL_URL || "").trim().replace(/\/+$/, "");
 let PUMPORTAL_BASE: string;
 try {
   const u = RAW_PUMPORTAL_URL ? new URL(RAW_PUMPORTAL_URL) : new URL(`https://${PUMP_HOST}`);
-  u.hostname = PUMP_HOST; // normalize host
-  PUMPORTAL_BASE = u.origin; // https://pumpportal.fun
+  u.hostname = PUMP_HOST;
+  PUMPORTAL_BASE = u.origin;
 } catch {
   PUMPORTAL_BASE = `https://${PUMP_HOST}`;
 }
 const PUMPORTAL_KEY = (process.env.PUMPORTAL_KEY || "").trim();
 console.log("[CONFIG] PumpPortal base:", PUMPORTAL_BASE);
 
+// Admin ops (optional)
 const ADMIN_SECRET  = process.env.ADMIN_SECRET || "";
 const ADMIN_OPS_URL = process.env.ADMIN_OPS_URL || "";
 
@@ -60,7 +60,6 @@ function newConnection(): Connection { return new Connection(RPCS[rpcIdx]!, "con
 function rotateConnection(): Connection { rpcIdx = (rpcIdx + 1) % RPCS.length; return new Connection(RPCS[rpcIdx]!, "confirmed"); }
 let connection = newConnection();
 
-// accept JSON array secret or bs58
 function toKeypair(secret: string): Keypair {
   try {
     const arr = JSON.parse(secret);
@@ -71,7 +70,6 @@ function toKeypair(secret: string): Keypair {
 }
 const devWallet = toKeypair(DEV_WALLET_PRIVATE_KEY);
 const mintPubkey = new PublicKey(TRACKED_MINT);
-const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 if (REWARD_WALLET !== devWallet.publicKey.toBase58()) {
   console.warn(
@@ -93,7 +91,7 @@ function nextTimes() {
 const apes = (bal: number) => Math.floor((Number(bal) || 0) / TOKENS_PER_APE);
 function chunks<T>(arr: T[], size: number): T[][] { const out: T[][] = []; for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size)); return out; }
 function looksRetryableMessage(msg: string) {
-  return /rate.?limit|429|timeout|temporar|connection|ECONNRESET|ETIMEDOUT|blockhash|Node is behind|Transaction was not confirmed/i.test(msg);
+  return /rate.?limit|429|timeout|temporar|connection|ECONNRESET|ETIMEDOUT|blockhash|Node is behind|Transaction was not confirmed|ACCOUNT_IN_USE/i.test(msg);
 }
 async function withRetries<T>(fn: () => Promise<T>, attempts = 5, baseMs = 350): Promise<T> {
   let lastErr: any;
@@ -125,11 +123,6 @@ async function withConnRetries<T>(fn: (c: Connection) => Promise<T>, attempts = 
   throw lastErr;
 }
 
-// Signature extractor (PumpPortal)
-function extractSig(j: any): string | null {
-  return j?.signature || j?.tx || j?.txid || j?.txId || j?.result || j?.sig || null;
-}
-
 // ================= Admin ops → front page =================
 async function recordOps(partial: { lastClaim?: any; lastSwap?: any; lastAirdrop?: any }) {
   if (!ADMIN_SECRET || !ADMIN_OPS_URL) return;
@@ -139,16 +132,15 @@ async function recordOps(partial: { lastClaim?: any; lastSwap?: any; lastAirdrop
       headers: { "content-type": "application/json", "x-admin-secret": ADMIN_SECRET },
       body: JSON.stringify(partial),
     });
-  } catch { /* swallow */ }
+  } catch {}
 }
 
-// ================= PumpPortal (claim) =================
+// ================= PumpPortal (CLAIM ONLY) =================
 function portalUrl(path: string) {
   const u = new URL(path, PUMPORTAL_BASE);
   if (PUMPORTAL_KEY && !u.searchParams.has("api-key")) u.searchParams.set("api-key", PUMPORTAL_KEY);
   return u.toString();
 }
-
 async function callPumportal(path: string, body: any, idemKey: string) {
   if (!PUMPORTAL_BASE || !PUMPORTAL_KEY) throw new Error("Missing PumpPortal config");
   const url = portalUrl(path);
@@ -156,7 +148,7 @@ async function callPumportal(path: string, body: any, idemKey: string) {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${PUMPORTAL_KEY}`,     // tolerated; main auth is ?api-key
+      authorization: `Bearer ${PUMPORTAL_KEY}`,    // tolerated
       "Idempotency-Key": idemKey,
     },
     body: JSON.stringify(body),
@@ -166,11 +158,130 @@ async function callPumportal(path: string, body: any, idemKey: string) {
   try { json = text ? JSON.parse(text) : {}; } catch {}
   return { res, json };
 }
+function extractSig(j: any): string | null {
+  return j?.signature || j?.tx || j?.txid || j?.txId || j?.result || j?.sig || null;
+}
+function parseNumber(x: any): number {
+  if (typeof x === "number") return x;
+  if (typeof x === "string") {
+    const n = Number(x);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+function deepFindNumber(obj: any, keys: string[]): number {
+  if (!obj || typeof obj !== "object") return 0;
+  for (const k of keys) {
+    if (k in obj) {
+      const v = (obj as any)[k];
+      const num = parseNumber(v);
+      if (num > 0) return num;
+    }
+  }
+  // recursive scan for first positive numeric-ish value
+  for (const v of Object.values(obj)) {
+    if (v && typeof v === "object") {
+      const hit = deepFindNumber(v, keys);
+      if (hit > 0) return hit;
+    }
+  }
+  return 0;
+}
+function parseClaimedSol(json: any): number {
+  // try common fields first
+  let sol = 0;
+  sol = Math.max(sol, parseNumber(json?.claimedAmount));
+  sol = Math.max(sol, parseNumber(json?.amount));
+  sol = Math.max(sol, parseNumber(json?.sol));
+  sol = Math.max(sol, parseNumber(json?.uiAmount));
+  // lamports?
+  const lamports =
+    parseNumber(json?.lamports) ||
+    parseNumber(json?.claimedLamports) ||
+    deepFindNumber(json, ["lamports", "claimedLamports"]);
+  if (lamports > 0) sol = Math.max(sol, lamports / 1_000_000_000);
+  // deep scan for weird keys that still look like SOL amounts
+  if (sol <= 0) {
+    sol = deepFindNumber(json, ["claimedAmount", "amount", "sol", "uiAmount"]);
+  }
+  return sol > 0 ? sol : 0;
+}
+async function getWalletSol(pubkey: PublicKey): Promise<number> {
+  const lamports = await connection.getBalance(pubkey, "confirmed");
+  return lamports / 1_000_000_000;
+}
+
+// ================= Jupiter v6 (SWAP) =================
+const JUP_QUOTE = "https://quote-api.jup.ag/v6/quote";
+const JUP_SWAP  = "https://quote-api.jup.ag/v6/swap";
+
+async function jupQuoteSOLtoToken(outMint: string, solAmount: number, slippageBps: number) {
+  const lamports = Math.max(Math.floor(solAmount * 1_000_000_000), 1);
+  const url = new URL(JUP_QUOTE);
+  url.searchParams.set("inputMint", "So11111111111111111111111111111111111111112");
+  url.searchParams.set("outputMint", outMint);
+  url.searchParams.set("amount", String(lamports));
+  url.searchParams.set("slippageBps", String(slippageBps));
+  url.searchParams.set("onlyDirectRoutes", "false");
+  url.searchParams.set("excludeDexes", "Serum"); // optional hygiene
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`Jupiter quote failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+async function jupBuildSwap(quoteResponse: any) {
+  const res = await fetch(JUP_SWAP, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      quoteResponse,
+      userPublicKey: devWallet.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      dynamicSlippage: { maxBps: Number(quoteResponse?.slippageBps ?? 100) },
+      prioritizationFeeLamports: "auto",
+    }),
+  });
+  const json = await res.json();
+  if (!res.ok || !json?.swapTransaction) {
+    throw new Error(`Jupiter swap-build failed: ${JSON.stringify(json)}`);
+  }
+  return json.swapTransaction as string; // base64
+}
+
+async function jupSendSwap(base64Tx: string) {
+  const tx = VersionedTransaction.deserialize(Buffer.from(base64Tx, "base64"));
+  tx.sign([devWallet]);
+  const sig = await withConnRetries(c => c.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+    preflightCommitment: "confirmed",
+    maxRetries: 3,
+  }));
+  await withConnRetries(c => c.confirmTransaction(sig, "confirmed"));
+  return sig;
+}
+
+async function jupSwapSpendSOL(outMint: string, solToSpend: number) {
+  // adaptive retries across slippage levels
+  const slippagePlan = [100, 200, 500]; // 1%, 2%, 5%
+  let lastErr: any;
+  for (const bps of slippagePlan) {
+    try {
+      const quote = await jupQuoteSOLtoToken(outMint, solToSpend, bps);
+      const b64 = await jupBuildSwap(quote);
+      const sig = await jupSendSwap(b64);
+      return { ok: true, sig, bps };
+    } catch (e) {
+      lastErr = e;
+      await sleep(250);
+    }
+  }
+  throw lastErr;
+}
 
 // ================= Chain helpers =================
 async function getHoldersAll(mint: string) {
   const mintPk = new PublicKey(mint);
-
   async function scan(programId: string, addFilter165 = false) {
     const filters: any[] = [{ memcmp: { offset: 0, bytes: mintPk.toBase58() } }];
     if (addFilter165) filters.unshift({ dataSize: 165 });
@@ -189,7 +300,6 @@ async function getHoldersAll(mint: string) {
     }
     return out;
   }
-
   const merged: Record<string, number> = {};
   try { Object.entries(await scan("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", true)).forEach(([k, v]) => merged[k] = (merged[k] ?? 0) + Number(v)); } catch {}
   try { Object.entries(await scan("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCx2w6G3W", false)).forEach(([k, v]) => merged[k] = (merged[k] ?? 0) + Number(v)); } catch {}
@@ -215,102 +325,16 @@ async function getMintDecimals(mintPk: PublicKey): Promise<number> {
   return dec;
 }
 
-// ================= Jupiter swap helpers (with adaptive retries) =================
-async function jupQuoteSOLtoMint(
-  outMint: string,
-  lamportsIn: number,
-  slippageBps = 1000,
-) {
-  const u = new URL("https://quote-api.jup.ag/v6/quote");
-  u.searchParams.set("inputMint", SOL_MINT);
-  u.searchParams.set("outputMint", outMint);
-  u.searchParams.set("amount", String(lamportsIn));     // SOL in lamports
-  u.searchParams.set("swapMode", "ExactIn");
-  u.searchParams.set("slippageBps", String(slippageBps));
-  u.searchParams.set("onlyDirectRoutes", "false");
-  u.searchParams.set("asLegacyTransaction", "false");
-  const res = await fetch(u.toString());
-  const j = await res.json();
-  if (!res.ok || j.error) throw new Error("Jupiter quote failed: " + (j.error || res.statusText));
-  return j;
-}
-
-async function jupBuildSwap(quoteResponse: any, userPubkey: string) {
-  const res = await fetch("https://api.jup.ag/swap/v1/swap", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      quoteResponse,
-      userPublicKey: userPubkey,
-      wrapAndUnwrapSol: true,
-      dynamicComputeUnitLimit: true,
-      dynamicSlippage: true,
-      prioritizationFeeLamports: {
-        priorityLevelWithMaxLamports: { priorityLevel: "veryHigh", maxLamports: 1_500_000 },
-      },
-    }),
-  });
-  const j = await res.json();
-  if (!res.ok || j.error) throw new Error("Jupiter swap build failed: " + (j.error || res.statusText));
-  return j;
-}
-
-async function jupSendSignedSwap(swapTxB64: string) {
-  const vtx = VersionedTransaction.deserialize(Buffer.from(swapTxB64, "base64"));
-  vtx.sign([devWallet]);
-  const sig = await withConnRetries(c => c.sendRawTransaction(vtx.serialize(), { skipPreflight: false, maxRetries: 3 }));
-  try {
-    const latest = await withConnRetries(c => c.getLatestBlockhash("finalized"));
-    await withConnRetries(c => c.confirmTransaction({ signature: sig, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight }, "confirmed"));
-  } catch {}
-  return sig;
-}
-
-// ONE place that performs swap with multiple re-quotes & adaptive settings
-async function performJupiterSwapExactIn(outMint: string, maxLamports: number): Promise<string | null> {
-  // protect against dust
-  if (maxLamports < 50_000) return null;
-
-  let attempt = 0;
-  const maxAttempts = 6;
-  let spendLamports = maxLamports;
-
-  while (attempt < maxAttempts) {
-    try {
-      // Re-check spendable balance each attempt & keep a small reserve.
-      const bal = await withConnRetries(c => c.getBalance(devWallet.publicKey, "confirmed"));
-      const reserve = Math.floor(0.005 * LAMPORTS_PER_SOL);
-      const capByBal = Math.max(0, Math.floor(bal * 0.9) - reserve);
-      spendLamports = Math.min(spendLamports, capByBal);
-      if (spendLamports < 50_000) return null;
-
-      // Adaptive slippage & amount trim per attempt.
-      const slippageBps = Math.min(1000 + attempt * 500, 4000); // 10% → 40% max for wild volatility
-      const trimmed = Math.floor(spendLamports * (1 - attempt * 0.03)); // trim 3% per retry
-      const toSpend = Math.max(trimmed, 50_000);
-
-      const quote = await jupQuoteSOLtoMint(outMint, toSpend, slippageBps);
-      const built = await jupBuildSwap(quote, devWallet.publicKey.toBase58());
-      const sig = await jupSendSignedSwap(built.swapTransaction);
-      return sig;
-    } catch (e: any) {
-      attempt++;
-      if (attempt >= maxAttempts) throw e;
-      await sleep(350 * attempt + Math.floor(Math.random() * 200));
-    }
-  }
-  return null;
-}
-
-// ================= Claim + Swap (T-60s) =================
+// ================= Claim + Jupiter Swap (T-60s) =================
 async function triggerClaimAndSwap90() {
   const cycleId = String(floorCycleStart().getTime());
+
+  // ---- CLAIM via PumpPortal
   if (!PUMPORTAL_BASE || !PUMPORTAL_KEY) {
     console.warn("[CLAIM] Skipping claim; no PumpPortal creds.");
-    return { claimed: 0, swapSig: null, claimSig: null };
+    return { claimed: 0, swapped: 0, claimTx: null, swapTx: null };
   }
 
-  // 1) Claim via PumpPortal (with retries)
   const { res: claimRes, json: claimJson } = await withRetries(
     () => callPumportal(
       "/api/trade",
@@ -322,24 +346,33 @@ async function triggerClaimAndSwap90() {
   if (!claimRes.ok) throw new Error(`Claim failed: ${JSON.stringify(claimJson)}`);
 
   const claimSig = extractSig(claimJson);
-  const claimed = Number(claimJson?.claimedAmount ?? 0);
+  const claimedParsed = parseClaimedSol(claimJson);
   const claimUrl = claimSig ? `https://solscan.io/tx/${claimSig}` : null;
-  console.log(`[CLAIM] ${claimed} SOL | ${claimUrl ?? "(no sig)"}`);
+  console.log(`[CLAIM] ~${claimedParsed} SOL | ${claimUrl ?? "(no sig)"}`);
 
-  // 2) Swap 90% of claimed SOL → TRACKED_MINT via Jupiter (adaptive retries)
+  // ---- Determine SOL to spend (90% of claimed, else 90% of wallet SOL)
+  const solNow = await getWalletSol(devWallet.publicKey);
+  const reserve = 0.02; // keep some SOL for fees
+  let spend = 0;
+  if (claimedParsed > 0) {
+    spend = Math.max(Number((claimedParsed * 0.9).toFixed(6)), 0.0001);
+  } else {
+    const available = Math.max(solNow - reserve, 0);
+    spend = Number((available * 0.90).toFixed(6));
+  }
+
   let swapSig: string | null = null;
-  const balLamports = await withConnRetries(c => c.getBalance(devWallet.publicKey, "confirmed"));
-  const reserveLamports = Math.floor(0.005 * LAMPORTS_PER_SOL); // keep ~0.005 SOL for fees
-  const maxSpendByBal = Math.max(0, Math.floor(balLamports * 0.9) - reserveLamports);
-  const maxSpendByClaim = Math.max(0, Math.floor(claimed * 0.9 * LAMPORTS_PER_SOL));
-  const spendLamports = Math.min(maxSpendByBal, maxSpendByClaim);
-
-  if (spendLamports >= 50_000) {
-    swapSig = await performJupiterSwapExactIn(TRACKED_MINT, spendLamports);
-    if (swapSig) {
-      console.log(`[SWAP] ${(spendLamports / LAMPORTS_PER_SOL).toFixed(6)} SOL → https://solscan.io/tx/${swapSig}`);
-    } else {
-      console.log("[SWAP] Skipped (insufficient after retries).");
+  if (spend > 0.00001) {
+    try {
+      const { sig, bps } = await withRetries(
+        () => jupSwapSpendSOL(TRACKED_MINT, spend),
+        3,
+        500
+      );
+      swapSig = sig;
+      console.log(`[SWAP] spent ~${spend} SOL via Jup (${bps} bps) | https://solscan.io/tx/${sig}`);
+    } catch (e: any) {
+      console.error("[SWAP] Jupiter failed after retries:", e?.message || e);
     }
   } else {
     console.log("[SWAP] Skipped (spend too small).");
@@ -347,11 +380,11 @@ async function triggerClaimAndSwap90() {
 
   const now = new Date().toISOString();
   await recordOps({
-    lastClaim: { at: now, amount: claimed, tx: claimSig, url: claimUrl },
-    lastSwap:  { at: now, amount: null,  tx: swapSig,  url: swapSig ? `https://solscan.io/tx/${swapSig}` : null },
+    lastClaim: { at: now, amount: claimedParsed, tx: claimSig, url: claimUrl },
+    lastSwap:  { at: now, amount: 0, tx: swapSig,  url: swapSig ? `https://solscan.io/tx/${swapSig}` : null },
   });
 
-  return { claimed, swapSig, claimSig };
+  return { claimed: claimedParsed, swapped: 0, claimTx: claimSig, swapTx: swapSig };
 }
 
 // ================= Snapshot + Airdrop (T-10s) =================
@@ -378,12 +411,12 @@ async function snapshotAndDistribute() {
   const holdersRaw = await getHoldersAll(TRACKED_MINT);
 
   // Exclude > cap (default 50,000,000 UI units)
-  const excluded = holdersRaw.filter(h => h.balance > AUTO_BLACKLIST_BALANCE);
-  if (excluded.length > 0) {
-    console.log(`[SNAPSHOT] Excluded ${excluded.length} wallets > ${AUTO_BLACKLIST_BALANCE}`);
+  const holders = holdersRaw.filter(h => h.balance <= AUTO_BLACKLIST_BALANCE);
+  const excludedCount = holdersRaw.length - holders.length;
+  if (excludedCount > 0) {
+    console.log(`[SNAPSHOT] Excluded ${excludedCount} wallets over cap ${AUTO_BLACKLIST_BALANCE}`);
   }
 
-  const holders = holdersRaw.filter(h => h.balance <= AUTO_BLACKLIST_BALANCE);
   const rows = holders.map(h => ({ wallet: h.wallet, apes: apes(h.balance) }))
                       .filter(r => r.apes > 0);
 
