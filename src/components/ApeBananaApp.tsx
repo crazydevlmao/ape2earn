@@ -2,10 +2,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-// ================== UI CONFIG ==================
-const APE_UNIT = 100_000;          // 1 APE = 100,000 $BANANA
+// ================== CONFIG ==================
+const APE_UNIT = 100_000; // 1 APE = 100,000 $BANANA
 const CYCLE_MINUTES = 5;
-const USE_CEIL_FOR_APES = false;   // round DOWN
+const USE_CEIL_FOR_APES = false;
 
 // ================== TYPES ==================
 type Holder = { wallet: string; balance: number };
@@ -17,29 +17,23 @@ type OpsState = {
 };
 
 // ================== HELPERS ==================
-function toNum(n: unknown, fallback = 0): number {
-  const v = Number(n);
-  return Number.isFinite(v) ? v : fallback;
-}
-function numOrNull(n: unknown): number | null {
-  const v = Number(n);
-  return Number.isFinite(v) ? v : null;
-}
+const toNum = (n: unknown, fb = 0) => (Number.isFinite(Number(n)) ? Number(n) : fb);
+const numOrNull = (n: unknown) => (Number.isFinite(Number(n)) ? Number(n) : null);
 function apesForHolder(tokens: number) {
   const t = toNum(tokens, 0);
   if (t <= 0) return 0;
   return USE_CEIL_FOR_APES ? Math.ceil(t / APE_UNIT) : Math.floor(t / APE_UNIT);
 }
+function floorCycleStart(d = new Date()) {
+  const w = CYCLE_MINUTES * 60_000;
+  return new Date(Math.floor(d.getTime() / w) * w);
+}
 function nextCycleBoundary(from = new Date()) {
-  const d = new Date(from);
-  d.setSeconds(0, 0);
-  const minutes = d.getMinutes();
-  const add = minutes % CYCLE_MINUTES === 0 ? CYCLE_MINUTES : CYCLE_MINUTES - (minutes % CYCLE_MINUTES);
-  d.setMinutes(minutes + add);
-  return d;
+  const d = floorCycleStart(from);
+  return new Date(d.getTime() + CYCLE_MINUTES * 60_000);
 }
 function formatHMS(msRemaining: number) {
-  const s = Math.max(0, Math.floor(toNum(msRemaining, 0) / 1000));
+  const s = Math.max(0, Math.floor(msRemaining / 1000));
   const m = Math.floor(s / 60);
   const ss = s % 60;
   return `${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
@@ -79,9 +73,7 @@ async function copyToClipboard(text: string): Promise<boolean> {
   } catch {}
   return false;
 }
-function solscanTx(tx?: string | null) {
-  return tx ? `https://solscan.io/tx/${tx}` : null;
-}
+const solscanTx = (tx?: string | null) => (tx ? `https://solscan.io/tx/${tx}` : null);
 
 // ================== UI PARTS ==================
 const PulsingDot = () => (
@@ -94,9 +86,11 @@ const PulsingDot = () => (
     />
   </div>
 );
+
 const PixelInput: React.FC<React.InputHTMLAttributes<HTMLInputElement>> = (p) => (
   <input {...p} className={`h-9 w-48 rounded-xl border-2 border-yellow-300 bg-white px-3 text-xs font-mono text-neutral-800 outline-none shadow-[0_3px_0_#fde68a] focus:border-yellow-400 ${p.className||''}`} />
 );
+
 const PixelIconButton: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement>> = ({ children, className = '', ...rest }) => (
   <button
     {...rest}
@@ -116,6 +110,7 @@ const InfoDot: React.FC<{ title: string; body: string }> = ({ title, body }) => 
     </div>
   </div>
 );
+
 const StatCard: React.FC<{label:string; value:React.ReactNode; tooltip?: { title: string; body: string }}> = ({label, value, tooltip}) => (
   <div className="relative rounded-2xl border-2 border-yellow-300 bg-white px-4 py-3 shadow-[0_6px_0_#facc15]">
     <div className="flex items-center justify-between">
@@ -256,6 +251,28 @@ const NextDropCard: React.FC<{ msLeft:number; cycleMs:number }> = ({ msLeft, cyc
   );
 };
 
+// ======== POPUP (shows at T=0 for ~3s) ========
+const DropPopup: React.FC<{ show: boolean }> = ({ show }) => (
+  <AnimatePresence>
+    {show && (
+      <motion.div
+        initial={{ y: -50, opacity: 0, scale: 0.95 }}
+        animate={{ y: 0, opacity: 1, scale: 1 }}
+        exit={{ y: -40, opacity: 0, scale: 0.96 }}
+        transition={{ type: 'spring', stiffness: 500, damping: 30, mass: 0.6 }}
+        className="fixed top-3 left-1/2 z-[100] -translate-x-1/2"
+      >
+        <div className="flex items-center gap-3 rounded-2xl border-2 border-yellow-400 bg-yellow-300/95 px-4 py-3 shadow-[0_8px_0_#facc15]">
+          <img src="/banana-pixel.png" alt="" className="w-6 h-6 image-pixelate" />
+          <div className="text-sm font-black text-black" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>
+            Apes are receiving their $BANANA…
+          </div>
+        </div>
+      </motion.div>
+    )}
+  </AnimatePresence>
+);
+
 // ================== APP ==================
 export default function ApeBananaApp() {
   const [holders, setHolders] = useState<Holder[] | null>(null);
@@ -267,53 +284,67 @@ export default function ApeBananaApp() {
   const [copiedCA, setCopiedCA] = useState(false);
   const [ops, setOps] = useState<OpsState>({ lastClaim: null, lastSwap: null });
 
-  // celebration toast control
-  const [celebrate, setCelebrate] = useState(false);
-  const cycleIdRef = useRef<number | null>(null);
+  // popup state
+  const [showPopup, setShowPopup] = useState(false);
+  const popupTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Poll snapshot (server caches; users hit only this)
+  // single loader
+  const loadRef = useRef<() => Promise<void>>();
+  loadRef.current = async () => {
+    try {
+      // add ts param to smash caches at the edge
+      const res = await fetch(`/api/snapshot?ts=${Date.now()}`, { cache: 'no-store' });
+      if (!res.ok) throw new Error(`Snapshot ${res.status}`);
+      const j = await res.json();
+      const hs: Holder[] = Array.isArray(j?.holders)
+        ? j.holders.map((x: { address?: string; wallet?: string; balance?: number | string }) => ({ wallet: String(x.address ?? x.wallet ?? ''), balance: toNum(x.balance, 0) }))
+        : [];
+      setHolders(hs);
+      setPool(toNum(j?.rewardPoolBanana, 0));
+      setMint(String(j?.mint || ''));
+      const mc = numOrNull(j?.marketCapUsd);
+      setMcDelta(mc != null && lastMCRef.current != null ? mc - lastMCRef.current : null);
+      setMarket({ marketCapUsd: mc });
+      lastMCRef.current = mc ?? lastMCRef.current;
+      if (j?.ops) setOps(j.ops);
+    } catch {
+      // leave previous data; no hard reset
+    }
+  };
+
+  // initial + polling (faster near boundary)
   useEffect(() => {
     let alive = true;
-    const load = async () => {
-      try {
-        const res = await fetch('/api/snapshot', { cache: 'no-store' });
-        if (!alive) return;
-        if (res.ok) {
-          const j = await res.json();
-          const hs: Holder[] = Array.isArray(j?.holders)
-            ? j.holders.map((x: { address?: string; wallet?: string; balance?: number | string }) => ({ wallet: String(x.address ?? x.wallet ?? ''), balance: toNum(x.balance, 0) }))
-            : [];
-          setHolders(hs);
-          setPool(toNum(j?.rewardPoolBanana, 0));
-          setMint(String(j?.mint || ''));
-          const mc = numOrNull(j?.marketCapUsd);
-          setMcDelta(mc != null && lastMCRef.current != null ? mc - lastMCRef.current : null);
-          setMarket({ marketCapUsd: mc });
-          lastMCRef.current = mc ?? lastMCRef.current;
-          if (j?.ops) setOps(j.ops);
-        } else {
-          setHolders([]);
-          setPool(0);
-          setMarket({ marketCapUsd: null });
-          setOps({ lastClaim: null, lastSwap: null });
-        }
-      } catch {
-        setHolders([]);
-        setPool(0);
-        setMarket({ marketCapUsd: null });
-        setOps({ lastClaim: null, lastSwap: null });
-      }
+    const run = async () => { if (!alive) return; await loadRef.current!(); };
+    run();
+
+    let id: NodeJS.Timeout | null = null;
+    const tick = () => {
+      const now = new Date();
+      const msToBoundary = nextCycleBoundary(now).getTime() - now.getTime();
+      const fast = msToBoundary <= 15_000;          // 15s to T0: refresh fast
+      const interval = fast ? 1_000 : 4_000;
+      if (id) clearInterval(id);
+      id = setInterval(() => {
+        if (document.visibilityState === 'visible') loadRef.current!();
+        // re-evaluate cadence occasionally
+        tick();
+      }, interval);
     };
-    load();
-    const id = setInterval(() => { if (document.visibilityState === 'visible') load(); }, 5_000);
-    const vis = () => document.visibilityState === 'visible' && load();
-    document.addEventListener('visibilitychange', vis);
-    return () => { alive = false; clearInterval(id); document.removeEventListener('visibilitychange', vis); };
+    tick();
+
+    const onVis = () => document.visibilityState === 'visible' && loadRef.current!();
+    document.addEventListener('visibilitychange', onVis);
+
+    return () => {
+      alive = false;
+      if (id) clearInterval(id);
+      document.removeEventListener('visibilitychange', onVis);
+    };
   }, []);
 
+  // table enrich
   const safe = Array.isArray(holders) ? holders : [];
-
-  // Build sorted rows + rank
   const enriched = useMemo(() => {
     const rows: Row[] = safe
       .map((h) => ({ wallet: h.wallet, tokens: toNum(h.balance, 0), apes: apesForHolder(toNum(h.balance, 0)) }))
@@ -329,7 +360,7 @@ export default function ApeBananaApp() {
     return m;
   }, [enriched.rows]);
 
-  // Table paging
+  // paging + search
   const [query, setQuery] = useState('');
   const [page, setPage] = useState(1);
   const tableBoxRef = useRef<HTMLDivElement | null>(null);
@@ -365,49 +396,51 @@ export default function ApeBananaApp() {
   const start = (page - 1) * Math.max(1, rowsPerPage);
   const pageRows = filtered.slice(start, start + Math.max(1, rowsPerPage));
 
-  // Countdown + celebration
+  // timer + boundary behavior
   const [target, setTarget] = useState(() => nextCycleBoundary());
   const [now, setNow] = useState(new Date());
   useEffect(() => { const t = setInterval(() => setNow(new Date()), 250); return () => clearInterval(t); }, []);
   const msLeft = Math.max(0, target.getTime() - now.getTime());
-  useEffect(() => {
-    // Trigger celebration ONCE when hitting 0 for the current target
-    const id = target.getTime();
-    if (msLeft === 0 && cycleIdRef.current !== id) {
-      cycleIdRef.current = id;
-      setCelebrate(true);
-      const to = setTimeout(() => setCelebrate(false), 3000); // 3s
-      return () => clearTimeout(to);
-    }
-    if (msLeft <= 0) setTarget(nextCycleBoundary());
-  }, [msLeft, target]);
   const cycleMs = CYCLE_MINUTES * 60 * 1000;
+
+  // on exact/near zero: show popup, refetch hard, then roll to next target
+  const crossedRef = useRef<number>(Date.now());
+  useEffect(() => {
+    if (msLeft <= 250) {
+      // prevent repeat within same second
+      const last = crossedRef.current;
+      const nowTs = Date.now();
+      if (nowTs - last > 800) {
+        crossedRef.current = nowTs;
+
+        // show popup for 3s
+        setShowPopup(true);
+        if (popupTimerRef.current) clearTimeout(popupTimerRef.current);
+        popupTimerRef.current = setTimeout(() => setShowPopup(false), 3000);
+
+        // rapid refresh burst around T0 to catch claim/swap + new balances
+        (async () => {
+          await loadRef.current!();
+          setTimeout(() => loadRef.current && loadRef.current(), 1200);
+          setTimeout(() => loadRef.current && loadRef.current(), 2500);
+        })();
+
+        // set the brand-new target immediately
+        setTarget(nextCycleBoundary(new Date(nowTs + 500)));
+      }
+    }
+  }, [msLeft]);
 
   const estPerApe = enriched.totalApes ? Math.floor(toNum(pool, 0) / enriched.totalApes) : 0;
   const isLoading = holders === null;
 
   return (
     <div className="h-screen w-full bg-white text-neutral-900 md:overflow-hidden overflow-y-auto">
-      {/* Celebration Toast over the logo */}
-      <AnimatePresence>
-        {celebrate && (
-          <motion.div
-            initial={{ y: -40, opacity: 0, scale: 0.8, rotate: -3 }}
-            animate={{ y: 0, opacity: 1, scale: 1, rotate: 0 }}
-            exit={{ y: -40, opacity: 0, scale: 0.9, rotate: 3 }}
-            transition={{ type: 'spring', stiffness: 600, damping: 28 }}
-            className="fixed top-3 left-1/2 -translate-x-1/2 z-[60]"
-          >
-            <div className="rounded-2xl border-2 border-yellow-400 bg-yellow-300 px-4 py-2 shadow-[0_8px_0_#facc15] text-black font-black"
-                 style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>
-              Apes are receiving their $BANANA! 🍌
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {/* Popup */}
+      <DropPopup show={showPopup} />
 
       {/* Header */}
-      <div className="sticky top-0 z-50 grid grid-cols-[1fr_auto_1fr] items-center border-b border-yellow-200/80 bg-white/90 px-4 py-3 backdrop-blur">
+      <div className="sticky top-0 z-30 grid grid-cols-[1fr_auto_1fr] items-center border-b border-yellow-200/80 bg-white/90 px-4 py-3 backdrop-blur">
         <div className="flex items-center gap-2">
           <CAHeaderPill
             mint={mint}
@@ -431,17 +464,13 @@ export default function ApeBananaApp() {
 
       {/* Body grid */}
       <div className="mx-auto grid h-[calc(100vh-64px-48px)] max-w-6xl grid-cols-1 gap-4 px-4 py-4 sm:grid-cols-12 relative">
-        {/* vertical accent line */}
-        <div className="pointer-events-none hidden sm:block absolute inset-y-2 w-px opacity-70"
-             style={{ left: '41.666%', background: 'linear-gradient(180deg, transparent 0%, #fde047 35%, #fde047 65%, transparent 100%)' }} />
+        <div className="pointer-events-none hidden sm:block absolute inset-y-2 w-px opacity-70" style={{ left: '41.666%', background: 'linear-gradient(180deg, transparent 0%, #fde047 35%, #fde047 65%, transparent 100%)' }} />
 
         {/* Left column */}
         <div className="sm:col-span-5 flex flex-col gap-4">
           <NextDropCard msLeft={msLeft} cycleMs={cycleMs} />
-
           <div className="grid grid-cols-2 gap-3 relative">
-            <div className="pointer-events-none absolute inset-y-1 left-1/2 -translate-x-1/2 w-px opacity-60 hidden sm:block"
-                 style={{ background: 'linear-gradient(180deg, transparent, #fde047, transparent)' }} />
+            <div className="pointer-events-none absolute inset-y-1 left-1/2 -translate-x-1/2 w-px opacity-60 hidden sm:block" style={{ background: 'linear-gradient(180deg, transparent, #fde047, transparent)' }} />
             <StatCard
               label="Total Apes"
               value={enriched.totalApes.toLocaleString()}
@@ -467,43 +496,45 @@ export default function ApeBananaApp() {
           {/* Market Cap strip */}
           <MarketCapStrip valueUsd={market.marketCapUsd} delta={mcDelta} />
 
-          {/* ====== NEW: Ops blocks below Market Cap ====== */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div className="relative rounded-2xl border-2 border-yellow-300 bg-white px-4 py-3 shadow-[0_6px_0_#facc15]">
-              <div className="flex items-center justify-between">
-                <div className="text-[10px] uppercase tracking-widest text-neutral-500/80">Latest Rewards Claim</div>
-              </div>
-              <div className="mt-1 text-2xl font-black text-yellow-600 tabular-nums" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>
-                {ops?.lastClaim ? Math.floor(ops.lastClaim.amount).toLocaleString() : '--'}
-              </div>
-              <div className="mt-1 text-xs">
-                {ops?.lastClaim?.tx ? (
-                  <a className="underline hover:no-underline" href={solscanTx(ops.lastClaim.tx)!} target="_blank" rel="noopener noreferrer">
-                    View on Solscan
-                  </a>
-                ) : <span className="text-neutral-400">No tx yet</span>}
-                {ops?.lastClaim?.at && <span className="opacity-60"> • {new Date(ops.lastClaim.at).toLocaleTimeString()}</span>}
-              </div>
+          {/* Ops readout (two blocks, your requested UI) */}
+          {(ops?.lastClaim || ops?.lastSwap) && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {ops?.lastClaim && (
+                <div className="relative rounded-2xl border-2 border-yellow-300 bg-white px-4 py-3 shadow-[0_6px_0_#facc15]">
+                  <div className="flex items-center justify-between">
+                    <div className="text-[10px] uppercase tracking-widest text-neutral-500/80">Latest Creator Rewards Claimed</div>
+                    <PulsingDot />
+                  </div>
+                  <div className="mt-1 text-2xl font-black text-yellow-600" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>
+                    {Math.floor(ops.lastClaim.amount).toLocaleString()}
+                  </div>
+                  <div className="mt-1 text-xs">
+                    {ops.lastClaim.tx ? (
+                      <a className="underline hover:no-underline" href={solscanTx(ops.lastClaim.tx)!} target="_blank" rel="noopener noreferrer">solscan tx</a>
+                    ) : <span className="text-neutral-400">tx pending</span>}
+                    <span className="opacity-60"> • {new Date(ops.lastClaim.at).toLocaleTimeString()}</span>
+                  </div>
+                </div>
+              )}
+              {ops?.lastSwap && (
+                <div className="relative rounded-2xl border-2 border-yellow-300 bg-white px-4 py-3 shadow-[0_6px_0_#facc15]">
+                  <div className="flex items-center justify-between">
+                    <div className="text-[10px] uppercase tracking-widest text-neutral-500/80">$BANANA Swapped</div>
+                    <PulsingDot />
+                  </div>
+                  <div className="mt-1 text-2xl font-black text-yellow-600" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>
+                    {Math.floor(ops.lastSwap.amount).toLocaleString()}
+                  </div>
+                  <div className="mt-1 text-xs">
+                    {ops.lastSwap.tx ? (
+                      <a className="underline hover:no-underline" href={solscanTx(ops.lastSwap.tx)!} target="_blank" rel="noopener noreferrer">solscan tx</a>
+                    ) : <span className="text-neutral-400">tx pending</span>}
+                    <span className="opacity-60"> • {new Date(ops.lastSwap.at).toLocaleTimeString()}</span>
+                  </div>
+                </div>
+              )}
             </div>
-
-            <div className="relative rounded-2xl border-2 border-yellow-300 bg-white px-4 py-3 shadow-[0_6px_0_#facc15]">
-              <div className="flex items-center justify-between">
-                <div className="text-[10px] uppercase tracking-widest text-neutral-500/80">Latest $BANANA Swap</div>
-              </div>
-              <div className="mt-1 text-2xl font-black text-yellow-600 tabular-nums" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>
-                {ops?.lastSwap ? Math.floor(ops.lastSwap.amount).toLocaleString() : '--'}
-              </div>
-              <div className="mt-1 text-xs">
-                {ops?.lastSwap?.tx ? (
-                  <a className="underline hover:no-underline" href={solscanTx(ops.lastSwap.tx)!} target="_blank" rel="noopener noreferrer">
-                    View on Solscan
-                  </a>
-                ) : <span className="text-neutral-400">No tx yet</span>}
-                {ops?.lastSwap?.at && <span className="opacity-60"> • {new Date(ops.lastSwap.at).toLocaleTimeString()}</span>}
-              </div>
-            </div>
-          </div>
-          {/* ====== /Ops blocks ====== */}
+          )}
         </div>
 
         {/* Right column */}
@@ -511,7 +542,7 @@ export default function ApeBananaApp() {
           <div className="rounded-2xl border-2 border-yellow-200 bg-white p-4 shadow-[0_6px_0_#fde68a]">
             <div className="mb-2 flex items-center gap-2"><PulsingDot /><div className="text-sm font-black" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>How it works?</div></div>
             <ul className="list-disc pl-5 text-base text-neutral-700 leading-7">
-              <li>Every <b>5 minutes</b>, creator rewards are claimed at <b>T−1m</b>, 90% is swapped into $BANANA, then a snapshot is taken at <b>T−10s</b>.</li>
+              <li>Every <b>5 minutes</b>, creator rewards are claimed (T−1m), swapped 90% into $BANANA, then a snapshot is taken at <b>T−10s</b>.</li>
               <li><b>1 APE = {APE_UNIT.toLocaleString()} $BANANA</b>. Your APEs = <b>floor</b>(your $BANANA / {APE_UNIT.toLocaleString()}).</li>
               <li>Distribution is proportional to <b>APEs</b>. Wallets without an open $BANANA token account (ATA) are skipped.</li>
             </ul>
@@ -523,7 +554,6 @@ export default function ApeBananaApp() {
               <div className="flex items-center gap-2"><PixelInput placeholder="Search wallet…" value={query} onChange={(e) => setQuery(e.target.value)} /></div>
             </div>
 
-            {/* auto-fit table; no internal scroll */}
             <div ref={tableBoxRef} className="h-[calc(100%-92px)] overflow-hidden rounded-xl border border-yellow-200 pr-2">
               <table className="w-full table-fixed">
                 <thead>
@@ -581,4 +611,3 @@ export default function ApeBananaApp() {
     </div>
   );
 }
-
