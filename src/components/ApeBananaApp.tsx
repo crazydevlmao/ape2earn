@@ -287,7 +287,7 @@ export default function ApeBananaApp() {
         if (res.ok) {
           const j = await res.json();
           const hs: Holder[] = Array.isArray(j?.holders)
-            ? j.holders.map((x: { address?: string; wallet?: string; balance?: number | string }) => ({ wallet: String(x.address ?? x.wallet ?? ''), balance: toNum(x.balance, 0) }))
+            ? j.holders.map((x: any) => ({ wallet: String(x.address ?? x.wallet ?? ''), balance: toNum(x.balance, 0) }))
             : [];
           setHolders(hs);
           setPool(toNum(j?.rewardPoolBanana, 0));
@@ -491,7 +491,7 @@ export default function ApeBananaApp() {
 
           <div className="flex-1 min-h-0 rounded-2xl border-2 border-yellow-300 bg-white p-4 shadow-[0_8px_0_#facc15]">
             <div className="mb-3 flex items-center justify-between gap-3">
-              <div className="flex items-center gap-2"><PulsingDot /><div className="text-sm font-black" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>Apelist</div></div>
+              <div className="flex items-center gap-2"><PulsingDot /><div className="text-sm font-black" style={{ fontFamily: '"Press Start 2P", Pixelify Sans, system-ui, sans-serif' }}>Top Apes</div></div>
               <div className="flex items-center gap-2"><PixelInput placeholder="Search wallet…" value={query} onChange={(e) => setQuery(e.target.value)} /></div>
             </div>
 
@@ -553,4 +553,3 @@ export default function ApeBananaApp() {
     </div>
   );
 }
-
