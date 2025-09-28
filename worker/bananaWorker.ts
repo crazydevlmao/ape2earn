@@ -30,13 +30,14 @@ const HELIUS_RPC =
 const QUICKNODE_RPC = process.env.QUICKNODE_RPC || ""; // optional failover
 
 // === PumpPortal config (bulletproof) ===
-const PUMP_HOST = "api.pumpportal.xyz";
+// Official base is pumpportal.fun (no api. subdomain)
+const PUMP_HOST = "pumpportal.fun";
 const RAW_PUMPORTAL_URL = (process.env.PUMPORTAL_URL || "").trim().replace(/\/+$/, "");
 let PUMPORTAL_BASE: string;
 try {
   const u = RAW_PUMPORTAL_URL ? new URL(RAW_PUMPORTAL_URL) : new URL(`https://${PUMP_HOST}`);
   u.hostname = PUMP_HOST; // force correct host even if env is wrong
-  PUMPORTAL_BASE = u.origin;
+  PUMPORTAL_BASE = u.origin; // e.g. https://pumpportal.fun
 } catch {
   PUMPORTAL_BASE = `https://${PUMP_HOST}`;
 }
@@ -135,13 +136,24 @@ async function recordOps(partial: { lastClaim?: any; lastSwap?: any; lastAirdrop
 }
 
 // ================= PumpPortal helpers =================
+function portalUrl(path: string) {
+  // PumpPortal Lightning API expects ?api-key=... in query (docs default)
+  const u = new URL(path, PUMPORTAL_BASE);
+  if (PUMPORTAL_KEY) {
+    // Append api-key if not present
+    if (!u.searchParams.has("api-key")) u.searchParams.set("api-key", PUMPORTAL_KEY);
+  }
+  return u.toString();
+}
+
 async function callPumportal(path: string, body: any, idemKey: string) {
   if (!PUMPORTAL_BASE || !PUMPORTAL_KEY) throw new Error("Missing PumpPortal config");
-  const url = new URL(path, PUMPORTAL_BASE).toString();
+  const url = portalUrl(path);
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
+      // Most examples use ?api-key=; keep header too in case they accept Bearer.
       authorization: `Bearer ${PUMPORTAL_KEY}`,
       "Idempotency-Key": idemKey,
     },
