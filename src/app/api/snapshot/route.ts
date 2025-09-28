@@ -12,9 +12,9 @@ const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
 const HELIUS_RPC = process.env.HELIUS_RPC || (HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "");
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 
-const TRACKED_MINT       = process.env.TRACKED_MINT  || "BCtJf5K5NVqCgksEb9rervX6Eae17NDZ8BSdGSoEpump";
-const REWARD_WALLET      = process.env.REWARD_WALLET || "2dPD6abjP5YrjFo3T53Uf82EuV6XFJLAZaq5KDEnvqC7";
-const PUMPFUN_AMM_WALLET = process.env.PUMPFUN_AMM_WALLET || "AFavQw5TtcuRM8R1LbVh8DG9w3EdU7ExEQMvEn4yrSZM";
+const TRACKED_MINT       = process.env.TRACKED_MINT  || "D1GavULFQNrNVVsXkroLVH6obvn7QKBptcHJFH8Mpump";
+const REWARD_WALLET      = process.env.REWARD_WALLET || "DSDpdNq7JLZ3BpngQKs89G9SW3Ex86rHYKLzRgN2zEwS";
+const PUMPFUN_AMM_WALLET = process.env.PUMPFUN_AMM_WALLET || "";
 const TOKENS_PER_APE     = Number(process.env.TOKENS_PER_APE || 100_000);
 const AUTO_BLACKLIST_BALANCE =
   Number(process.env.AUTO_BLACKLIST_BALANCE ?? 50_000_000);
@@ -299,3 +299,4 @@ export async function GET(req: Request) {
     });
   }
 }
+
