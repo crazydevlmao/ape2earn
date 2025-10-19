@@ -165,55 +165,46 @@ function abortableFetch(url: string, init: RequestInit = {}, timeoutMs = 12000) 
 }
 
 // /ultra/v1/order + /ultra/v1/execute
+// Replace your existing jupQuoteSolToToken with this Ultra version (adds `taker` and domain fallback)
 async function jupQuoteSolToToken(outMint: string, solUiAmount: number, slippageBps: number) {
   const inputMint = "So11111111111111111111111111111111111111112";
   const amountLamports = Math.max(1, Math.floor(solUiAmount * LAMPORTS_PER_SOL));
-  const url = `https://lite-api.jup.ag/ultra/v1/order?inputMint=${inputMint}&outputMint=${outMint}&amount=${amountLamports}&slippageBps=${slippageBps}`;
+  const taker = devWallet.publicKey.toBase58(); // REQUIRED for Ultra to return a transaction
 
-  const orderResp = await withRetries(async () => {
-    const r = await abortableFetch(url, { method: "GET", headers: { "Accept": "application/json" } }, 12000);
-    if (!r.ok) throw new Error(`Ultra /order HTTP ${r.status}`);
-    const j = await r.json();
-    if (!j?.transaction || !j?.requestId) throw new Error("Ultra /order missing transaction/requestId");
-    return j;
-  }, 5, 400);
+  const bases = ["https://lite-api.jup.ag", "https://api.jup.ag"]; // try lite, then pro
+  let lastErr: any = null;
 
-  return orderResp; // { transaction(base64), requestId }
-}
+  for (const base of bases) {
+    const url =
+      `${base}/ultra/v1/order` +
+      `?inputMint=${inputMint}` +
+      `&outputMint=${outMint}` +
+      `&amount=${amountLamports}` +
+      `&slippageBps=${slippageBps}` +
+      `&taker=${taker}`;
 
-async function jupSwap(conn: Connection, signer: Keypair, orderResp: any) {
-  const txBase64 = orderResp?.transaction;
-  const requestId = orderResp?.requestId;
-  if (!txBase64 || !requestId) throw new Error("Invalid Ultra order response");
+    try {
+      const orderResp = await withRetries(async () => {
+        const ctrl = new AbortController();
+        const tm = setTimeout(() => ctrl.abort(), 12_000);
+        try {
+          const r = await fetch(url, { method: "GET", headers: { "Accept": "application/json" }, signal: ctrl.signal });
+          if (!r.ok) throw new Error(`Ultra /order HTTP ${r.status}`);
+          const j = await r.json();
+          if (!j?.transaction || !j?.requestId) throw new Error("Ultra /order missing transaction/requestId");
+          return j;
+        } finally {
+          clearTimeout(tm);
+        }
+      }, 5, 400);
 
-  const txBytes = Uint8Array.from(Buffer.from(txBase64, "base64"));
-  const tx = VersionedTransaction.deserialize(txBytes);
-  tx.sign([signer]);
-  const signedBase64 = Buffer.from(tx.serialize()).toString("base64");
-
-  const executeUrl = "https://lite-api.jup.ag/ultra/v1/execute";
-
-  const sig = await withRetries(async () => {
-    const r = await abortableFetch(executeUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify({ signedTransaction: signedBase64, requestId }),
-    }, 15000);
-
-    if (!r.ok) {
-      const txt = await r.text().catch(() => "");
-      throw new Error(`Ultra /execute HTTP ${r.status} ${txt}`);
+      return orderResp; // { transaction (base64), requestId }
+    } catch (e) {
+      lastErr = e;
+      // fall through to try next base
     }
-
-    const j = await r.json();
-    const signature = j?.signature || j?.txid || j?.txId || null;
-    if (!signature) throw new Error(`Ultra /execute no signature: ${JSON.stringify(j)}`);
-
-    await conn.confirmTransaction(signature, "confirmed");
-    return signature;
-  }, 5, 500);
-
-  return sig;
+  }
+  throw new Error(String(lastErr?.message || lastErr));
 }
 
 /* ================= Core ops ================= */
@@ -329,3 +320,4 @@ loop().catch((err) => {
   console.error("worker crashed:", err);
   process.exit(1);
 });
+
