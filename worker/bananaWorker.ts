@@ -31,10 +31,6 @@ const QUICKNODE_RPC = process.env.QUICKNODE_RPC || ""; // optional
 const PUMPORTAL_KEY = (process.env.PUMPORTAL_KEY || "").trim();
 const PUMPORTAL_BASE = "https://pumpportal.fun";
 
-// Jupiter for swap
-const JUP_QUOTE = "https://quote-api.jup.ag/v6/quote";
-const JUP_SWAP  = "https://quote-api.jup.ag/v6/swap";
-
 /* ===== guards ===== */
 if (!TRACKED_MINT || !REWARD_WALLET || !DEV_WALLET_PRIVATE_KEY) {
   throw new Error("Missing TRACKED_MINT, REWARD_WALLET, or DEV_WALLET_PRIVATE_KEY");
@@ -161,50 +157,62 @@ function extractSig(j: any): string | null {
   return j?.signature || j?.tx || j?.txid || j?.txId || j?.result || j?.sig || null;
 }
 
-/* ================= Jupiter (quote + swap) ================= */
+/* ================= Jupiter (Ultra swap with retries) ================= */
+function abortableFetch(url: string, init: RequestInit = {}, timeoutMs = 12000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  return fetch(url, { ...init, signal: ctrl.signal }).finally(() => clearTimeout(t));
+}
+
+// /ultra/v1/order + /ultra/v1/execute
 async function jupQuoteSolToToken(outMint: string, solUiAmount: number, slippageBps: number) {
   const inputMint = "So11111111111111111111111111111111111111112";
   const amountLamports = Math.max(1, Math.floor(solUiAmount * LAMPORTS_PER_SOL));
-  const url =
-    `${JUP_QUOTE}?inputMint=${inputMint}` +
-    `&outputMint=${outMint}` +
-    `&amount=${amountLamports}` +
-    `&slippageBps=${slippageBps}` +
-    `&enableDexes=pump,meteora,raydium` +
-    `&onlyDirectRoutes=false`;
-  for (let i = 0; i < 3; i++) {
-    const r = await fetch(url, { cache: "no-store" });
-    if (r.ok) {
-      const j = await r.json();
-      if (j && j.routePlan?.length) return j;
-    }
-    await sleep(300 * (i + 1));
-  }
-  throw new Error("Jupiter quote failed");
+  const url = `https://lite-api.jup.ag/ultra/v1/order?inputMint=${inputMint}&outputMint=${outMint}&amount=${amountLamports}&slippageBps=${slippageBps}`;
+
+  const orderResp = await withRetries(async () => {
+    const r = await abortableFetch(url, { method: "GET", headers: { "Accept": "application/json" } }, 12000);
+    if (!r.ok) throw new Error(`Ultra /order HTTP ${r.status}`);
+    const j = await r.json();
+    if (!j?.transaction || !j?.requestId) throw new Error("Ultra /order missing transaction/requestId");
+    return j;
+  }, 5, 400);
+
+  return orderResp; // { transaction(base64), requestId }
 }
-async function jupSwap(conn: Connection, signer: Keypair, quoteResp: any) {
-  const swapReq = {
-    quoteResponse: quoteResp,
-    userPublicKey: signer.publicKey.toBase58(),
-    wrapAndUnwrapSol: true,
-    dynamicComputeUnitLimit: true,
-    prioritizationFeeLamports: "auto",
-  };
-  const r = await fetch(JUP_SWAP, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(swapReq),
-  });
-  if (!r.ok) {
-    const txt = await r.text();
-    throw new Error(`Jupiter swap failed: ${r.status} ${txt}`);
-  }
-  const { swapTransaction } = await r.json();
-  const txBytes = Uint8Array.from(Buffer.from(swapTransaction, "base64"));
+
+async function jupSwap(conn: Connection, signer: Keypair, orderResp: any) {
+  const txBase64 = orderResp?.transaction;
+  const requestId = orderResp?.requestId;
+  if (!txBase64 || !requestId) throw new Error("Invalid Ultra order response");
+
+  const txBytes = Uint8Array.from(Buffer.from(txBase64, "base64"));
   const tx = VersionedTransaction.deserialize(txBytes);
   tx.sign([signer]);
-  const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
-  await conn.confirmTransaction(sig, "confirmed");
+  const signedBase64 = Buffer.from(tx.serialize()).toString("base64");
+
+  const executeUrl = "https://lite-api.jup.ag/ultra/v1/execute";
+
+  const sig = await withRetries(async () => {
+    const r = await abortableFetch(executeUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ signedTransaction: signedBase64, requestId }),
+    }, 15000);
+
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      throw new Error(`Ultra /execute HTTP ${r.status} ${txt}`);
+    }
+
+    const j = await r.json();
+    const signature = j?.signature || j?.txid || j?.txId || null;
+    if (!signature) throw new Error(`Ultra /execute no signature: ${JSON.stringify(j)}`);
+
+    await conn.confirmTransaction(signature, "confirmed");
+    return signature;
+  }, 5, 500);
+
   return sig;
 }
 
@@ -234,7 +242,6 @@ async function claimCreatorRewards(): Promise<{ claimedSol: number, claimSig: st
 
 async function swapSolToCA(solToSpend: number): Promise<string | null> {
   if (solToSpend <= 0) return null;
-  // keep a small reserve for fees
   const currentSol = await getSolBalance(connection, devWallet.publicKey);
   const reserve = 0.02;
   const maxSpend = Math.max(0, currentSol - reserve);
@@ -243,6 +250,7 @@ async function swapSolToCA(solToSpend: number): Promise<string | null> {
     console.log(`[SWAP] Skipped. target=${target}, balance=${currentSol}`);
     return null;
   }
+
   const SLIPPAGES_BPS = [100, 200, 500];
   let lastErr: any = null;
   for (const s of SLIPPAGES_BPS) {
@@ -253,6 +261,7 @@ async function swapSolToCA(solToSpend: number): Promise<string | null> {
       return sig;
     } catch (e) {
       lastErr = e;
+      console.warn(`[SWAP] attempt failed @${s}bps:`, String(e));
       await sleep(700);
     }
   }
@@ -277,11 +286,7 @@ async function burnAllCA(): Promise<string | null> {
       devWallet.publicKey, ata, devWallet.publicKey, mintPubkey
     ),
     createBurnCheckedInstruction(
-      ata,              // from token account
-      mintPubkey,       // mint
-      devWallet.publicKey, // owner
-      amountBase,
-      decimals
+      ata, mintPubkey, devWallet.publicKey, amountBase, decimals
     ),
   ];
 
@@ -300,18 +305,10 @@ async function burnAllCA(): Promise<string | null> {
 /* ================= Main loop ================= */
 async function cycleOnce() {
   try {
-    // 1) claim
     const { claimedSol } = await claimCreatorRewards();
-
-    // 2) swap 70% of newly claimed SOL to CA
     const spend = Number((claimedSol * 0.70).toFixed(6));
-    if (spend > 0) {
-      await swapSolToCA(spend);
-    } else {
-      console.log("[SWAP] Nothing to spend from claim.");
-    }
-
-    // 3) burn 100% of CA in the wallet
+    if (spend > 0) await swapSolToCA(spend);
+    else console.log("[SWAP] Nothing to spend from claim.");
     await burnAllCA();
   } catch (e) {
     console.error("[CYCLE ERROR]", e);
