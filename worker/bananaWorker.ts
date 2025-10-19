@@ -159,7 +159,6 @@ function abortableFetch(url: string, init: RequestInit = {}, timeoutMs = 20000) 
   return fetch(url, { ...init, signal: ctrl.signal }).finally(() => clearTimeout(t));
 }
 
-// Get Ultra order (returns transaction + requestId)
 async function jupQuoteSolToToken(outMint: string, solUiAmount: number, slippageBps: number) {
   const inputMint = "So11111111111111111111111111111111111111112";
   const amountLamports = Math.max(1, Math.floor(solUiAmount * LAMPORTS_PER_SOL));
@@ -180,7 +179,7 @@ async function jupQuoteSolToToken(outMint: string, solUiAmount: number, slippage
         return j;
       }, 4, 500);
       return orderResp;
-    } catch (e) {
+    } catch (e: any) {
       lastErr = e;
       await sleep(400);
     }
@@ -188,7 +187,6 @@ async function jupQuoteSolToToken(outMint: string, solUiAmount: number, slippage
   throw new Error(String(lastErr?.message || lastErr));
 }
 
-// Execute Ultra transaction
 async function jupSwap(conn: Connection, signer: Keypair, orderResp: any) {
   const txBase64 = orderResp?.transaction;
   const requestId = orderResp?.requestId;
@@ -220,7 +218,7 @@ async function jupSwap(conn: Connection, signer: Keypair, orderResp: any) {
         return signature;
       }, 4, 600);
       return sig;
-    } catch (e) {
+    } catch (e: any) {
       lastErr = e;
       await sleep(500);
     }
@@ -271,7 +269,7 @@ async function swapSolToCA(solToSpend: number) {
       const sig = await jupSwap(connection, devWallet, quote);
       console.log(`[SWAP] Spent ${target} SOL @${s}bps | https://solscan.io/tx/${sig}`);
       return sig;
-    } catch (e) {
+    } catch (e: any) {
       lastErr = e;
       console.warn(`[SWAP] attempt failed @${s}bps: ${String(e.message || e)}`);
       await sleep(800);
@@ -321,7 +319,7 @@ async function cycleOnce() {
     if (spend > 0) await swapSolToCA(spend);
     else console.log("[SWAP] Nothing to spend from claim.");
     await burnAllCA();
-  } catch (e) {
+  } catch (e: any) {
     console.error("[CYCLE ERROR]", e);
   }
 }
@@ -336,7 +334,7 @@ async function loop() {
   }
 }
 
-loop().catch(e => {
+loop().catch((e: any) => {
   console.error("worker crashed:", e);
   process.exit(1);
 });
