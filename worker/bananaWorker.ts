@@ -131,26 +131,28 @@ async function getTokenBalanceUi(owner: PublicKey, mint: PublicKey) {
 
 /* ================= PumpPortal ================= */
 async function callPumportal(path: string, body: any, idemKey: string) {
-  const url = `${PUMPORTAL_BASE}${path}`;
-  const res = await fetch(url, {
+  const url = new URL(path, PUMPORTAL_BASE);
+  if (PUMPORTAL_KEY && !url.searchParams.has("api-key"))
+    url.searchParams.set("api-key", PUMPORTAL_KEY);
+
+  const res = await fetch(url.toString(), {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${PUMPORTAL_KEY}`,
+      authorization: `Bearer ${PUMPORTAL_KEY}`, // ✅ keep Bearer + key
       "Idempotency-Key": idemKey,
     },
     body: JSON.stringify(body),
   });
+
   const text = await res.text();
-  let json = {};
+  let json: any = {};
   try {
     json = text ? JSON.parse(text) : {};
   } catch {}
   return { res, json };
 }
-function extractSig(j: any) {
-  return j?.signature || j?.tx || j?.txid || j?.txId || j?.sig || null;
-}
+
 
 /* ================= Jupiter Ultra ================= */
 function abortableFetch(url: string, init: RequestInit = {}, timeoutMs = 20000) {
@@ -338,3 +340,4 @@ loop().catch((e: any) => {
   console.error("worker crashed:", e);
   process.exit(1);
 });
+
