@@ -16,16 +16,13 @@ import bs58 from "bs58";
 
 /* ================= CONFIG ================= */
 const CYCLE_SECONDS = 60;
-
 const TRACKED_MINT = process.env.TRACKED_MINT || "";
 const REWARD_WALLET = process.env.REWARD_WALLET || "";
 const DEV_WALLET_PRIVATE_KEY = process.env.DEV_WALLET_PRIVATE_KEY || "";
-
 const HELIUS_RPC =
   process.env.HELIUS_RPC ||
   `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY || ""}`;
 const QUICKNODE_RPC = process.env.QUICKNODE_RPC || "";
-
 const PUMPORTAL_KEY = (process.env.PUMPORTAL_KEY || "").trim();
 const PUMPORTAL_BASE = "https://pumpportal.fun";
 
@@ -46,7 +43,6 @@ function rotateConnection(): Connection {
   return new Connection(RPCS[rpcIdx]!, "confirmed");
 }
 let connection = newConnection();
-
 function toKeypair(secret: string): Keypair {
   try {
     const arr = JSON.parse(secret);
@@ -63,11 +59,11 @@ function sleep(ms: number) {
   return new Promise(r => setTimeout(r, ms));
 }
 function looksRetryableMessage(msg: string) {
-  return /rate.?limit|429|timeout|temporar|connection|ECONNRESET|ETIMEDOUT|abort|Node is behind|Transaction was not confirmed/i.test(
+  return /rate.?limit|429|timeout|temporar|connection|ECONNRESET|ETIMEDOUT|blockhash|Node is behind|Transaction was not confirmed/i.test(
     msg
   );
 }
-async function withRetries<T>(fn: () => Promise<T>, attempts = 5, baseMs = 400): Promise<T> {
+async function withRetries<T>(fn: () => Promise<T>, attempts = 5, baseMs = 350): Promise<T> {
   let lastErr: any;
   for (let i = 0; i < attempts; i++) {
     try {
@@ -76,7 +72,7 @@ async function withRetries<T>(fn: () => Promise<T>, attempts = 5, baseMs = 400):
       lastErr = e;
       const msg = String(e?.message || e);
       if (i === attempts - 1 || !looksRetryableMessage(msg)) break;
-      const delay = baseMs * Math.pow(1.8, i) + Math.floor(Math.random() * 200);
+      const delay = baseMs * Math.pow(1.7, i) + Math.floor(Math.random() * 200);
       await sleep(delay);
     }
   }
@@ -99,7 +95,7 @@ async function withConnRetries<T>(fn: (c: Connection) => Promise<T>, attempts = 
   throw lastErr;
 }
 
-/* ================= Chain helpers ================= */
+/* ================= Helpers ================= */
 async function getSolBalance(conn: Connection, pk: PublicKey) {
   return (await conn.getBalance(pk, "confirmed")) / LAMPORTS_PER_SOL;
 }
@@ -113,38 +109,46 @@ async function pollSolDelta(conn: Connection, owner: PublicKey, preSol: number) 
   const b = await getSolBalance(conn, owner);
   return { postSol: b, deltaSol: Math.max(0, b - preSol) };
 }
-async function getMintDecimals(mintPk: PublicKey) {
-  const info = await withConnRetries(c => c.getParsedAccountInfo(mintPk, "confirmed"));
-  return (info as any)?.value?.data?.parsed?.info?.decimals ?? 9;
+async function getMintDecimals(mintPk: PublicKey): Promise<number> {
+  const info = (await withConnRetries(c =>
+    c.getParsedAccountInfo(mintPk, "confirmed")
+  )) as any;
+  return info?.value?.data?.parsed?.info?.decimals ?? 9;
 }
 async function getTokenBalanceUi(owner: PublicKey, mint: PublicKey) {
-  const resp = await withConnRetries(c =>
+  const resp = (await withConnRetries(c =>
     c.getParsedTokenAccountsByOwner(owner, { mint }, "confirmed")
-  );
+  )) as any;
   let total = 0;
-  for (const it of (resp as any).value || []) {
-    const amt = (it.account.data as any)?.parsed?.info?.tokenAmount?.uiAmount ?? 0;
-    total += Number(amt) || 0;
+  for (const it of resp.value as any[]) {
+    const parsed: any = (it.account.data as any)?.parsed?.info?.tokenAmount;
+    const v =
+      typeof parsed?.uiAmount === "number"
+        ? parsed.uiAmount
+        : Number(parsed?.uiAmountString ?? 0);
+    total += v || 0;
   }
   return total;
 }
 
 /* ================= PumpPortal ================= */
+function portalUrl(path: string) {
+  const u = new URL(path, PUMPORTAL_BASE);
+  if (PUMPORTAL_KEY && !u.searchParams.has("api-key"))
+    u.searchParams.set("api-key", PUMPORTAL_KEY);
+  return u.toString();
+}
 async function callPumportal(path: string, body: any, idemKey: string) {
-  const url = new URL(path, PUMPORTAL_BASE);
-  if (PUMPORTAL_KEY && !url.searchParams.has("api-key"))
-    url.searchParams.set("api-key", PUMPORTAL_KEY);
-
-  const res = await fetch(url.toString(), {
+  const url = portalUrl(path);
+  const res = await fetch(url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${PUMPORTAL_KEY}`, // ✅ keep Bearer + key
+      authorization: `Bearer ${PUMPORTAL_KEY}`,
       "Idempotency-Key": idemKey,
     },
     body: JSON.stringify(body),
   });
-
   const text = await res.text();
   let json: any = {};
   try {
@@ -152,41 +156,47 @@ async function callPumportal(path: string, body: any, idemKey: string) {
   } catch {}
   return { res, json };
 }
-
+function extractSig(j: any): string | null {
+  return (
+    j?.signature ||
+    j?.tx ||
+    j?.txid ||
+    j?.txId ||
+    j?.result ||
+    j?.sig ||
+    null
+  );
+}
 
 /* ================= Jupiter Ultra ================= */
-function abortableFetch(url: string, init: RequestInit = {}, timeoutMs = 20000) {
+function abortableFetch(url: string, init: RequestInit = {}, timeoutMs = 12000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  return fetch(url, { ...init, signal: ctrl.signal }).finally(() => clearTimeout(t));
+  return fetch(url, { ...init, signal: ctrl.signal }).finally(() =>
+    clearTimeout(t)
+  );
 }
 
 async function jupQuoteSolToToken(outMint: string, solUiAmount: number, slippageBps: number) {
   const inputMint = "So11111111111111111111111111111111111111112";
   const amountLamports = Math.max(1, Math.floor(solUiAmount * LAMPORTS_PER_SOL));
   const taker = devWallet.publicKey.toBase58();
-  const bases = ["https://lite-api.jup.ag", "https://api.jup.ag"];
-  let lastErr: any = null;
+  const base = "https://lite-api.jup.ag/ultra/v1";
 
-  for (const base of bases) {
-    const url = `${base}/ultra/v1/order?inputMint=${inputMint}&outputMint=${outMint}&amount=${amountLamports}&slippageBps=${slippageBps}&taker=${taker}`;
+  while (true) {
     try {
-      const orderResp = await withRetries(async () => {
-        const r = await abortableFetch(url, { headers: { Accept: "application/json" } });
-        if (!r.ok) throw new Error(`Ultra /order HTTP ${r.status}`);
-        const j = await r.json();
-        if (!j?.transaction || !j?.requestId)
-          throw new Error("Ultra /order missing transaction/requestId");
-        j._ultraBase = base;
-        return j;
-      }, 4, 500);
-      return orderResp;
+      const url = `${base}/order?inputMint=${inputMint}&outputMint=${outMint}&amount=${amountLamports}&slippageBps=${slippageBps}&taker=${taker}`;
+      const r = await abortableFetch(url, { headers: { Accept: "application/json" } });
+      if (!r.ok) throw new Error(`Ultra /order HTTP ${r.status}`);
+      const j = await r.json();
+      if (!j?.transaction || !j?.requestId)
+        throw new Error("Ultra /order missing transaction/requestId");
+      return j;
     } catch (e: any) {
-      lastErr = e;
-      await sleep(400);
+      console.warn("[SWAP] /order failed:", e.message || e);
+      await sleep(2000); // retry every 2 seconds until success
     }
   }
-  throw new Error(String(lastErr?.message || lastErr));
 }
 
 async function jupSwap(conn: Connection, signer: Keypair, orderResp: any) {
@@ -198,38 +208,33 @@ async function jupSwap(conn: Connection, signer: Keypair, orderResp: any) {
   const tx = VersionedTransaction.deserialize(txBytes);
   tx.sign([signer]);
   const signedBase64 = Buffer.from(tx.serialize()).toString("base64");
+  const base = "https://lite-api.jup.ag/ultra/v1";
 
-  const bases = ["https://lite-api.jup.ag", "https://api.jup.ag"];
-  let lastErr: any = null;
-  for (const base of bases) {
+  while (true) {
     try {
-      const sig = await withRetries(async () => {
-        const r = await abortableFetch(`${base}/ultra/v1/execute`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: JSON.stringify({ signedTransaction: signedBase64, requestId }),
-        });
-        if (!r.ok) {
-          const txt = await r.text().catch(() => "");
-          throw new Error(`Ultra /execute HTTP ${r.status} ${txt}`);
-        }
-        const j = await r.json();
-        const signature = j?.signature || j?.txid || j?.txId || null;
-        if (!signature) throw new Error("Ultra /execute no signature");
-        await conn.confirmTransaction(signature, "confirmed");
-        return signature;
-      }, 4, 600);
-      return sig;
+      const r = await abortableFetch(`${base}/execute`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ signedTransaction: signedBase64, requestId }),
+      });
+      if (!r.ok) {
+        const txt = await r.text().catch(() => "");
+        throw new Error(`Ultra /execute HTTP ${r.status} ${txt}`);
+      }
+      const j = await r.json();
+      const signature = j?.signature || j?.txid || j?.txId || null;
+      if (!signature) throw new Error("Ultra /execute no signature");
+      await conn.confirmTransaction(signature, "confirmed");
+      return signature;
     } catch (e: any) {
-      lastErr = e;
-      await sleep(500);
+      console.warn("[SWAP] /execute failed:", e.message || e);
+      await sleep(2000); // retry every 2 seconds until success
     }
   }
-  throw new Error(String(lastErr?.message || lastErr));
 }
 
 /* ================= Core ops ================= */
-async function claimCreatorRewards() {
+async function claimCreatorRewards(): Promise<{ claimedSol: number; claimSig: string | null }> {
   if (!PUMPORTAL_KEY) return { claimedSol: 0, claimSig: null };
   const preSol = await getSolBalance(connection, devWallet.publicKey);
   const { res, json } = await withRetries(
@@ -253,35 +258,34 @@ async function claimCreatorRewards() {
   return { claimedSol, claimSig };
 }
 
-async function swapSolToCA(solToSpend: number) {
+async function swapSolToCA(solToSpend: number): Promise<string | null> {
   if (solToSpend <= 0) return null;
   const currentSol = await getSolBalance(connection, devWallet.publicKey);
   const reserve = 0.02;
-  const target = Math.min(solToSpend, Math.max(0, currentSol - reserve));
+  const maxSpend = Math.max(0, currentSol - reserve);
+  const target = Math.min(solToSpend, maxSpend);
   if (target <= 0.00001) {
     console.log(`[SWAP] Skipped. target=${target}, balance=${currentSol}`);
     return null;
   }
 
-  const SLIPPAGES = [100, 200, 500];
-  let lastErr: any = null;
-  for (const s of SLIPPAGES) {
+  const SLIPPAGES_BPS = [100, 200, 500];
+  for (const s of SLIPPAGES_BPS) {
     try {
       const quote = await jupQuoteSolToToken(TRACKED_MINT, target, s);
       const sig = await jupSwap(connection, devWallet, quote);
       console.log(`[SWAP] Spent ${target} SOL @${s}bps | https://solscan.io/tx/${sig}`);
       return sig;
     } catch (e: any) {
-      lastErr = e;
-      console.warn(`[SWAP] attempt failed @${s}bps: ${String(e.message || e)}`);
-      await sleep(800);
+      console.warn(`[SWAP] failed @${s}bps:`, e.message || e);
+      await sleep(2000);
     }
   }
-  console.error("[SWAP] Jupiter failed after retries:", String(lastErr?.message || lastErr));
+  console.error("[SWAP] Jupiter failed for all slippages.");
   return null;
 }
 
-async function burnAllCA() {
+async function burnAllCA(): Promise<string | null> {
   const decimals = await getMintDecimals(mintPubkey);
   const caBalanceUi = await getTokenBalanceUi(devWallet.publicKey, mintPubkey);
   if (!(caBalanceUi > 0)) {
@@ -313,7 +317,7 @@ async function burnAllCA() {
   return sig;
 }
 
-/* ================= Loop ================= */
+/* ================= Main loop ================= */
 async function cycleOnce() {
   try {
     const { claimedSol } = await claimCreatorRewards();
@@ -336,8 +340,7 @@ async function loop() {
   }
 }
 
-loop().catch((e: any) => {
-  console.error("worker crashed:", e);
+loop().catch(err => {
+  console.error("worker crashed:", err);
   process.exit(1);
 });
-
