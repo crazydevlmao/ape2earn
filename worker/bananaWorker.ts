@@ -157,45 +157,51 @@ function extractSig(j: any): string | null {
   return j?.signature || j?.tx || j?.txid || j?.txId || j?.result || j?.sig || null;
 }
 
-/* ================= Jupiter (Ultra swap with retries) ================= */
+/* ================= Jupiter (Ultra first, Legacy fallback) ================= */
 function abortableFetch(url: string, init: RequestInit = {}, timeoutMs = 12000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   return fetch(url, { ...init, signal: ctrl.signal }).finally(() => clearTimeout(t));
 }
 
-// /ultra/v1/order (GET) – requires taker – returns { transaction (base64), requestId }
-async function jupQuoteSolToToken(outMint: string, solUiAmount: number, slippageBps: number) {
+// Ultra /order (POST) – requires `taker`. If Ultra can’t produce a transaction, fall back to Legacy v6 /quote.
+async function jupQuoteSolToToken(outMint: string, solUiAmount: number, slippageBps: number): Promise<any> {
   const inputMint = "So11111111111111111111111111111111111111112";
   const amountLamports = Math.max(1, Math.floor(solUiAmount * LAMPORTS_PER_SOL));
-  const taker = devWallet.publicKey.toBase58(); // REQUIRED for Ultra to return a transaction
+  const taker = devWallet.publicKey.toBase58();
 
-  const bases = ["https://lite-api.jup.ag", "https://api.jup.ag"]; // fallback
+  // For tiny trades Ultra often returns no tx — use Legacy directly to reduce noise.
+  if (amountLamports < 5_000_000) {
+    return await legacyQuote(inputMint, outMint, amountLamports, slippageBps);
+  }
+
+  const bases = ["https://lite-api.jup.ag", "https://api.jup.ag"];
   let lastErr: any = null;
 
   for (const base of bases) {
-    const url =
-      `${base}/ultra/v1/order` +
-      `?inputMint=${inputMint}` +
-      `&outputMint=${outMint}` +
-      `&amount=${amountLamports}` +
-      `&slippageBps=${slippageBps}` +
-      `&taker=${taker}`;
-
     try {
+      const body = { inputMint, outputMint: outMint, amount: amountLamports, slippageBps, taker };
       const orderResp = await withRetries(async () => {
-        const ctrl = new AbortController();
-        const tm = setTimeout(() => ctrl.abort(), 12_000);
-        try {
-          const r = await fetch(url, { method: "GET", headers: { "Accept": "application/json" }, signal: ctrl.signal });
-          if (!r.ok) throw new Error(`Ultra /order HTTP ${r.status}`);
-          const j = await r.json();
-          if (!j?.transaction || !j?.requestId) throw new Error("Ultra /order missing transaction/requestId");
-          return j;
-        } finally {
-          clearTimeout(tm);
+        const r = await abortableFetch(`${base}/ultra/v1/order`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          body: JSON.stringify(body),
+        }, 12000);
+
+        if (!r.ok) {
+          const txt = await r.text().catch(() => "");
+          throw new Error(`Ultra /order HTTP ${r.status} ${txt}`);
         }
-      }, 5, 400);
+
+        const j = await r.json();
+        const txB64 = j?.transaction;
+        const reqId = j?.requestId;
+        if (!txB64 || typeof txB64 !== "string" || txB64.length === 0 || !reqId) {
+          throw new Error("Ultra /order missing transaction/requestId");
+        }
+        j._ultraBase = base;
+        return j;
+      }, 3, 400);
 
       return orderResp;
     } catch (e) {
@@ -203,55 +209,118 @@ async function jupQuoteSolToToken(outMint: string, solUiAmount: number, slippage
       // try next base
     }
   }
-  throw new Error(String(lastErr?.message || lastErr));
+
+  // Ultra couldn't produce a transaction — use Legacy v6 quote
+  return await legacyQuote(inputMint, outMint, amountLamports, slippageBps);
+
+  async function legacyQuote(inputMint: string, outputMint: string, amountLamports: number, slippageBps: number) {
+    const url =
+      "https://quote-api.jup.ag/v6/quote" +
+      `?inputMint=${inputMint}` +
+      `&outputMint=${outputMint}` +
+      `&amount=${amountLamports}` +
+      `&slippageBps=${slippageBps}` +
+      `&enableDexes=pump,meteora,raydium` +
+      `&onlyDirectRoutes=false`;
+
+    const q = await withRetries(async () => {
+      const r = await abortableFetch(url, { method: "GET", headers: { "Accept": "application/json" } }, 10000);
+      if (!r.ok) throw new Error(`Legacy /quote HTTP ${r.status}`);
+      const j = await r.json();
+      if (!j?.routePlan?.length) throw new Error("Legacy /quote returned no routePlan");
+      j._legacy = true;
+      return j;
+    }, 3, 400);
+
+    return q;
+  }
 }
 
-// /ultra/v1/execute (POST) – submit signed tx – returns { signature | txid }
-async function jupSwap(conn: Connection, signer: Keypair, orderResp: any) {
-  const txBase64 = orderResp?.transaction;
-  const requestId = orderResp?.requestId;
-  if (!txBase64 || !requestId) throw new Error("Invalid Ultra order response");
+// Ultra /execute (POST) if Ultra order was used; otherwise Legacy /swap.
+// If Ultra execute fails with 401/5xx on one base, retry on the other base using the same signed tx.
+async function jupSwap(conn: Connection, signer: Keypair, quoteOrOrderResp: any) {
+  // Ultra path
+  if (quoteOrOrderResp?.transaction && quoteOrOrderResp?.requestId) {
+    const txBytes = Uint8Array.from(Buffer.from(quoteOrOrderResp.transaction, "base64"));
+    const tx = VersionedTransaction.deserialize(txBytes);
+    tx.sign([signer]);
+    const signedBase64 = Buffer.from(tx.serialize()).toString("base64");
+    const requestId = String(quoteOrOrderResp.requestId);
 
-  const txBytes = Uint8Array.from(Buffer.from(txBase64, "base64"));
-  const tx = VersionedTransaction.deserialize(txBytes);
-  tx.sign([signer]);
-  const signedBase64 = Buffer.from(tx.serialize()).toString("base64");
+    const bases = ["https://lite-api.jup.ag", "https://api.jup.ag"];
+    const preferredFirst =
+      quoteOrOrderResp._ultraBase && bases.includes(quoteOrOrderResp._ultraBase)
+        ? [quoteOrOrderResp._ultraBase, ...bases.filter(b => b !== quoteOrOrderResp._ultraBase)]
+        : bases;
 
-  const bases = ["https://lite-api.jup.ag", "https://api.jup.ag"]; // fallback
-  let lastErr: any = null;
+    let lastErr: any = null;
+    for (const base of preferredFirst) {
+      try {
+        const sig = await withRetries(async () => {
+          const r = await abortableFetch(`${base}/ultra/v1/execute`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Accept": "application/json" },
+            body: JSON.stringify({ signedTransaction: signedBase64, requestId }),
+          }, 15000);
 
-  for (const base of bases) {
-    const executeUrl = `${base}/ultra/v1/execute`;
+          if (!r.ok) {
+            const txt = await r.text().catch(() => "");
+            throw new Error(`Ultra /execute HTTP ${r.status} ${txt}`);
+          }
 
-    try {
-      const sig = await withRetries(async () => {
-        const r = await abortableFetch(executeUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Accept": "application/json" },
-          body: JSON.stringify({ signedTransaction: signedBase64, requestId }),
-        }, 15000);
+          const j = await r.json();
+          const signature = j?.signature || j?.txid || j?.txId || null;
+          if (!signature) throw new Error(`Ultra /execute no signature: ${JSON.stringify(j)}`);
 
-        if (!r.ok) {
-          const txt = await r.text().catch(() => "");
-          throw new Error(`Ultra /execute HTTP ${r.status} ${txt}`);
-        }
+          await conn.confirmTransaction(signature, "confirmed");
+          return signature;
+        }, 3, 500);
 
-        const j = await r.json();
-        const signature = j?.signature || j?.txid || j?.txId || null;
-        if (!signature) throw new Error(`Ultra /execute no signature: ${JSON.stringify(j)}`);
-
-        await conn.confirmTransaction(signature, "confirmed");
-        return signature;
-      }, 5, 500);
-
-      return sig;
-    } catch (e) {
-      lastErr = e;
-      // try next base
+        return sig;
+      } catch (e) {
+        lastErr = e;
+        // loop tries other base once
+      }
     }
+    throw lastErr;
   }
 
-  throw new Error(String(lastErr?.message || lastErr));
+  // Legacy path
+  if (quoteOrOrderResp?._legacy && quoteOrOrderResp?.routePlan?.length) {
+    const JUP_SWAP = "https://quote-api.jup.ag/v6/swap";
+    const swapReq = {
+      quoteResponse: quoteOrOrderResp,
+      userPublicKey: signer.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      prioritizationFeeLamports: "auto",
+    };
+
+    const signature = await withRetries(async () => {
+      const r = await abortableFetch(JUP_SWAP, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify(swapReq),
+      }, 15000);
+
+      if (!r.ok) {
+        const txt = await r.text().catch(() => "");
+        throw new Error(`Legacy /swap HTTP ${r.status} ${txt}`);
+      }
+
+      const { swapTransaction } = await r.json();
+      const txBytes = Uint8Array.from(Buffer.from(swapTransaction, "base64"));
+      const tx = VersionedTransaction.deserialize(txBytes);
+      tx.sign([signer]);
+      const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
+      await conn.confirmTransaction(sig, "confirmed");
+      return sig;
+    }, 3, 500);
+
+    return signature;
+  }
+
+  throw new Error("Invalid Jupiter response: neither Ultra nor Legacy paths were usable");
 }
 
 /* ================= Core ops ================= */
@@ -293,8 +362,8 @@ async function swapSolToCA(solToSpend: number): Promise<string | null> {
   let lastErr: any = null;
   for (const s of SLIPPAGES_BPS) {
     try {
-      const quote = await jupQuoteSolToToken(TRACKED_MINT, target, s);
-      const sig = await jupSwap(connection, devWallet, quote);
+      const quoteOrOrder = await jupQuoteSolToToken(TRACKED_MINT, target, s);
+      const sig = await jupSwap(connection, devWallet, quoteOrOrder);
       console.log(`[SWAP] Spent ${target} SOL @${s}bps | https://solscan.io/tx/${sig}`);
       return sig;
     } catch (e) {
