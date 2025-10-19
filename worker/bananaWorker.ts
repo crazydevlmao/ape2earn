@@ -164,14 +164,13 @@ function abortableFetch(url: string, init: RequestInit = {}, timeoutMs = 12000) 
   return fetch(url, { ...init, signal: ctrl.signal }).finally(() => clearTimeout(t));
 }
 
-// /ultra/v1/order + /ultra/v1/execute
-// Replace your existing jupQuoteSolToToken with this Ultra version (adds `taker` and domain fallback)
+// /ultra/v1/order (GET) – requires taker – returns { transaction (base64), requestId }
 async function jupQuoteSolToToken(outMint: string, solUiAmount: number, slippageBps: number) {
   const inputMint = "So11111111111111111111111111111111111111112";
   const amountLamports = Math.max(1, Math.floor(solUiAmount * LAMPORTS_PER_SOL));
   const taker = devWallet.publicKey.toBase58(); // REQUIRED for Ultra to return a transaction
 
-  const bases = ["https://lite-api.jup.ag", "https://api.jup.ag"]; // try lite, then pro
+  const bases = ["https://lite-api.jup.ag", "https://api.jup.ag"]; // fallback
   let lastErr: any = null;
 
   for (const base of bases) {
@@ -198,12 +197,60 @@ async function jupQuoteSolToToken(outMint: string, solUiAmount: number, slippage
         }
       }, 5, 400);
 
-      return orderResp; // { transaction (base64), requestId }
+      return orderResp;
     } catch (e) {
       lastErr = e;
-      // fall through to try next base
+      // try next base
     }
   }
+  throw new Error(String(lastErr?.message || lastErr));
+}
+
+// /ultra/v1/execute (POST) – submit signed tx – returns { signature | txid }
+async function jupSwap(conn: Connection, signer: Keypair, orderResp: any) {
+  const txBase64 = orderResp?.transaction;
+  const requestId = orderResp?.requestId;
+  if (!txBase64 || !requestId) throw new Error("Invalid Ultra order response");
+
+  const txBytes = Uint8Array.from(Buffer.from(txBase64, "base64"));
+  const tx = VersionedTransaction.deserialize(txBytes);
+  tx.sign([signer]);
+  const signedBase64 = Buffer.from(tx.serialize()).toString("base64");
+
+  const bases = ["https://lite-api.jup.ag", "https://api.jup.ag"]; // fallback
+  let lastErr: any = null;
+
+  for (const base of bases) {
+    const executeUrl = `${base}/ultra/v1/execute`;
+
+    try {
+      const sig = await withRetries(async () => {
+        const r = await abortableFetch(executeUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          body: JSON.stringify({ signedTransaction: signedBase64, requestId }),
+        }, 15000);
+
+        if (!r.ok) {
+          const txt = await r.text().catch(() => "");
+          throw new Error(`Ultra /execute HTTP ${r.status} ${txt}`);
+        }
+
+        const j = await r.json();
+        const signature = j?.signature || j?.txid || j?.txId || null;
+        if (!signature) throw new Error(`Ultra /execute no signature: ${JSON.stringify(j)}`);
+
+        await conn.confirmTransaction(signature, "confirmed");
+        return signature;
+      }, 5, 500);
+
+      return sig;
+    } catch (e) {
+      lastErr = e;
+      // try next base
+    }
+  }
+
   throw new Error(String(lastErr?.message || lastErr));
 }
 
@@ -320,4 +367,3 @@ loop().catch((err) => {
   console.error("worker crashed:", err);
   process.exit(1);
 });
-
